@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Rust runtime build output
+runtime/target/
+
+# SwiftPM build output
+app/.build/
+app/.swiftpm/
+
+# Packaged app and fixtures
+dist/
+fixtures/d3d11-triangle/build/
+
+# Local machine-specific Claude Code settings
+.claude/settings.local.json

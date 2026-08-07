@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.25)
+project(darwinplay_d3d11_fixture LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+add_executable(darwinplay-d3d11-fixture main.cpp)
+target_compile_options(darwinplay-d3d11-fixture PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(darwinplay-d3d11-fixture PRIVATE d3d11 dxgi d3dcompiler user32 gdi32)
