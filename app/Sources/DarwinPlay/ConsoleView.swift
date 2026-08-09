@@ -63,7 +63,7 @@ struct ConsoleView: View {
   }
 
   private var isRunning: Bool {
-    model.steamIsRunning || !model.runningGameIDs.isEmpty || model.isManagingWine
+    model.steamIsRunning || !model.runningGameIDs.isEmpty || model.isManagingDarwinWine
   }
 
   private var filteredEntries: [ConsoleEntry] {

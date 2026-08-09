@@ -27,6 +27,19 @@ struct ConsoleEntry: Identifiable {
   let message: String
 }
 
+struct OperationProgressState: Equatable {
+  var phase: String
+  var message: String
+  var progress: Double?
+  var overallProgress: Double?
+  var currentBytes: UInt64?
+  var totalBytes: UInt64?
+
+  var displayProgress: Double? {
+    overallProgress ?? progress
+  }
+}
+
 enum PlayableItem: Identifiable {
   case steam(SteamGame)
   case imported(GameRecord)
@@ -54,7 +67,7 @@ final class AppModel {
   var selection: LibrarySelection?
   var inspection: PEReport?
   var doctorReport: DoctorReport?
-  var wineStatus: WineStatus?
+  var runtimeStatus: DarwinWineStatus?
   var dxmtStatus: DxmtStatus?
   var steamStatus: SteamStatus?
   var steamProfile: SteamCompatibilityProfile?
@@ -66,8 +79,10 @@ final class AppModel {
   var isImporting = false
   var isShowingSettings = false
   var isInstallingSteam = false
-  var isManagingWine = false
-  var wineManagementTitle = ""
+  var isManagingDarwinWine = false
+  var darwinWineProgress: OperationProgressState?
+  var steamInstallProgress: OperationProgressState?
+  var isManagingDxmt = false
   var steamSessionRunning = false
   var steamLaunchingAppID: UInt32?
   var runningGameIDs: Set<UUID> = []
@@ -76,8 +91,26 @@ final class AppModel {
     steamSessionRunning || steamStatus?.running == true
   }
 
+  var effectiveSteamUiBackend: GraphicsBackendPreference {
+    switch settings.steamUiBackend {
+    case .auto:
+      dxmtStatus?.installed == true ? .dxmt : .wined3d
+    case .dxmt:
+      .dxmt
+    case .wined3d:
+      .wined3d
+    }
+  }
+
   var steamUiRestartRequired: Bool {
-    steamStatus?.running == true && steamStatus?.uiPolicyCurrent == false
+    guard steamStatus?.running == true else { return false }
+    if steamStatus?.uiPolicyCurrent == false || steamStatus?.uiBackend != effectiveSteamUiBackend {
+      return true
+    }
+    if effectiveSteamUiBackend == .dxmt {
+      return steamStatus?.uiDxmtVersion != dxmtStatus?.version
+    }
+    return false
   }
 
   @ObservationIgnored private var libraryStore: LibraryStore?
@@ -154,7 +187,7 @@ final class AppModel {
       if let activityStore {
         activity = try await activityStore.load()
       }
-      await refreshWine()
+      await refreshRuntime()
       await refreshDxmtStatus()
       await refreshSteam()
       if selection == nil {
@@ -232,7 +265,6 @@ final class AppModel {
     runningGameIDs.insert(game.id)
     recordPlayed(.imported(game))
     appendConsole(.wine, .info, "Launching \(game.name)")
-    let winePath = normalizedWinePath
     let backend = settings.graphicsBackend
 
     let task = Task {
@@ -243,7 +275,7 @@ final class AppModel {
 
       do {
         for try await event in runtimeClient.launch(
-          game: game, winePath: winePath, backend: backend)
+          game: game, backend: backend)
         {
           consume(event, component: .wine)
         }
@@ -261,7 +293,7 @@ final class AppModel {
     }
 
     do {
-      try await runtimeClient.stop(gameID: game.id, winePath: normalizedWinePath)
+      try await runtimeClient.stop(gameID: game.id)
       appendConsole(.wine, .info, "Stopped \(game.name)")
     } catch {
       errorMessage = error.localizedDescription
@@ -277,60 +309,99 @@ final class AppModel {
     }
 
     do {
-      try await runtimeClient.resetPrefix(gameID: game.id, winePath: normalizedWinePath)
+      try await runtimeClient.resetPrefix(gameID: game.id)
       appendConsole(.wine, .success, "Reset prefix for \(game.name)")
     } catch {
       errorMessage = error.localizedDescription
     }
   }
 
-  func installWine() {
-    guard let runtimeClient, !isManagingWine else { return }
-    beginWineManagement("Installing Wine", stream: runtimeClient.installWine())
-  }
+  func installDarwinWine() async {
+    guard let runtimeClient, !isManagingDarwinWine, !steamIsRunning, runningGameIDs.isEmpty else {
+      return
+    }
 
-  func reinstallWine() {
-    guard let runtimeClient, !isManagingWine else { return }
-    beginWineManagement("Reinstalling Wine", stream: runtimeClient.reinstallWine())
-  }
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = false
+    panel.resolvesAliases = true
+    panel.message = "Select a DarwinWine runtime artifact (.tar.zst)"
+    guard panel.runModal() == .OK, let archive = panel.url else { return }
 
-  func removeWine() {
-    guard let runtimeClient, !isManagingWine else { return }
-    beginWineManagement("Removing Wine", stream: runtimeClient.removeWine())
-  }
+    isManagingDarwinWine = true
+    darwinWineProgress = OperationProgressState(
+      phase: "Preparing",
+      message: "Installing DarwinWine",
+      progress: nil,
+      overallProgress: 0,
+      currentBytes: nil,
+      totalBytes: nil
+    )
+    appendConsole(.runtime, .info, "Installing DarwinWine from \(archive.lastPathComponent)")
+    defer {
+      isManagingDarwinWine = false
+      darwinWineProgress = nil
+    }
 
-  func openHomebrewWebsite() {
-    guard let url = URL(string: "https://brew.sh") else { return }
-    NSWorkspace.shared.open(url)
-  }
-
-  func openWineApplication() {
-    guard let path = wineStatus?.winePath, let range = path.range(of: ".app") else { return }
-    let applicationPath = String(path[..<range.upperBound])
-    NSWorkspace.shared.open(URL(fileURLWithPath: applicationPath))
-  }
-
-  func openPrivacyAndSecurity() {
-    if let url = URL(
-      string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension")
-    {
-      NSWorkspace.shared.open(url)
+    do {
+      for try await event in runtimeClient.installDarwinWine(archive: archive) {
+        updateProgress(from: event, target: &darwinWineProgress)
+        consume(event, component: .runtime)
+      }
+      await refreshRuntime()
+      await refreshSteam()
+      appendConsole(.runtime, .success, "DarwinWine is ready")
+    } catch {
+      appendConsole(.runtime, .error, error.localizedDescription)
+      errorMessage = error.localizedDescription
+      await refreshRuntime()
     }
   }
 
-  func retryWineProbe() {
-    Task { await refreshWine() }
+  func removeDarwinWine() async {
+    guard let runtimeClient, !isManagingDarwinWine, !steamIsRunning, runningGameIDs.isEmpty else {
+      return
+    }
+    isManagingDarwinWine = true
+    defer { isManagingDarwinWine = false }
+    do {
+      try await runtimeClient.removeDarwinWine()
+      await refreshRuntime()
+      await refreshSteam()
+      appendConsole(.runtime, .info, "DarwinWine removed")
+    } catch {
+      errorMessage = error.localizedDescription
+    }
+  }
+
+  func retryRuntimeProbe() {
+    Task { await refreshRuntime() }
   }
 
   func installSteam() async {
-    guard let runtimeClient, !isInstallingSteam, wineStatus?.ready == true else {
+    guard let runtimeClient, !isInstallingSteam, runtimeStatus?.ready == true else {
       return
     }
     isInstallingSteam = true
+    steamInstallProgress = OperationProgressState(
+      phase: "Preparing",
+      message: "Preparing Steam installation",
+      progress: nil,
+      overallProgress: 0,
+      currentBytes: nil,
+      totalBytes: nil
+    )
     appendConsole(.steam, .info, "Installing the Windows Steam client")
-    defer { isInstallingSteam = false }
+    defer {
+      isInstallingSteam = false
+      steamInstallProgress = nil
+    }
     do {
-      steamStatus = try await runtimeClient.installSteam(winePath: normalizedWinePath)
+      for try await event in runtimeClient.installSteam() {
+        updateProgress(from: event, target: &steamInstallProgress)
+        consume(event, component: .steam)
+      }
       appendConsole(.steam, .success, "Steam installation completed")
       await refreshSteam()
     } catch {
@@ -344,7 +415,7 @@ final class AppModel {
       return
     }
     do {
-      let status = try await runtimeClient.steamStatus(winePath: normalizedWinePath)
+      let status = try await runtimeClient.steamStatus()
       steamStatus = status
       if status.installed {
         let currentGames = try await runtimeClient.steamGames().games.sorted {
@@ -464,8 +535,11 @@ final class AppModel {
       return
     }
     steamLaunchingAppID = nil
-    appendConsole(.steam, .info, "Opening Steam")
-    beginSteamSession(runtimeClient.startSteam(winePath: normalizedWinePath))
+    appendConsole(.steam, .info, "Opening Steam with \(effectiveSteamUiBackend.displayName)")
+    beginSteamSession(
+      runtimeClient.startSteam(
+        backend: settings.steamUiBackend
+      ))
   }
 
   func restartSteamUI() {
@@ -473,8 +547,11 @@ final class AppModel {
       return
     }
     steamLaunchingAppID = nil
-    appendConsole(.steam, .info, "Restarting Steam UI with software web rendering")
-    beginSteamSession(runtimeClient.restartSteam(winePath: normalizedWinePath))
+    appendConsole(.steam, .info, "Restarting Steam UI with \(effectiveSteamUiBackend.displayName)")
+    beginSteamSession(
+      runtimeClient.restartSteam(
+        backend: settings.steamUiBackend
+      ))
   }
 
   func launchSelectedSteamGame() {
@@ -492,7 +569,6 @@ final class AppModel {
     beginSteamSession(
       runtimeClient.launchSteamGame(
         appID: game.appId,
-        winePath: normalizedWinePath,
         backend: settings.graphicsBackend
       ))
   }
@@ -512,7 +588,7 @@ final class AppModel {
       return
     }
     do {
-      try await runtimeClient.stopSteam(winePath: normalizedWinePath)
+      try await runtimeClient.stopSteam()
       steamTask?.cancel()
       steamTask = nil
       steamSessionRunning = false
@@ -529,10 +605,10 @@ final class AppModel {
       return
     }
     do {
-      try await runtimeClient.resetSteam(winePath: normalizedWinePath)
+      try await runtimeClient.resetSteam()
       steamGames = []
       compatibilityProfiles = [:]
-      steamStatus = try await runtimeClient.steamStatus(winePath: normalizedWinePath)
+      steamStatus = try await runtimeClient.steamStatus()
       if case .steam = selection {
         selection = .games
       }
@@ -542,25 +618,25 @@ final class AppModel {
     }
   }
 
-  func refreshWine() async {
+  func refreshRuntime() async {
     guard let runtimeClient else { return }
     do {
-      let status = try await runtimeClient.wineStatus(winePath: normalizedWinePath)
-      wineStatus = status
+      let status = try await runtimeClient.runtimeStatus()
+      runtimeStatus = status
       if status.ready {
-        doctorReport = try? await runtimeClient.doctor(winePath: normalizedWinePath)
+        doctorReport = try? await runtimeClient.doctor()
       } else {
         doctorReport = nil
       }
     } catch {
-      wineStatus = nil
+      runtimeStatus = nil
       doctorReport = nil
       errorMessage = error.localizedDescription
     }
   }
 
   func refreshDoctor() async {
-    await refreshWine()
+    await refreshRuntime()
   }
 
   func refreshDxmtStatus() async {
@@ -576,6 +652,42 @@ final class AppModel {
     }
   }
 
+  func installLatestDxmt() async {
+    guard let runtimeClient, !isManagingDxmt else { return }
+    isManagingDxmt = true
+    appendConsole(.graphics, .info, "Downloading the latest managed DXMT release")
+    defer { isManagingDxmt = false }
+    do {
+      dxmtStatus = try await runtimeClient.installLatestDxmt()
+      compatibilityProfiles = [:]
+      let version = dxmtStatus?.version ?? "latest"
+      appendConsole(.graphics, .success, "DXMT \(version) installed")
+      await refreshSteam()
+      await refreshSteamProfile()
+    } catch {
+      appendConsole(.graphics, .error, error.localizedDescription)
+      errorMessage = error.localizedDescription
+    }
+  }
+
+  func updateDxmt() async {
+    guard let runtimeClient, !isManagingDxmt else { return }
+    isManagingDxmt = true
+    appendConsole(.graphics, .info, "Updating DXMT from the official release")
+    defer { isManagingDxmt = false }
+    do {
+      dxmtStatus = try await runtimeClient.updateDxmt()
+      compatibilityProfiles = [:]
+      let version = dxmtStatus?.version ?? "latest"
+      appendConsole(.graphics, .success, "DXMT updated to \(version)")
+      await refreshSteam()
+      await refreshSteamProfile()
+    } catch {
+      appendConsole(.graphics, .error, error.localizedDescription)
+      errorMessage = error.localizedDescription
+    }
+  }
+
   func installDxmt(source: URL, mode: DxmtMode) async {
     guard let runtimeClient else {
       return
@@ -585,6 +697,7 @@ final class AppModel {
       dxmtStatus = try await runtimeClient.installDxmt(source: source, mode: mode)
       compatibilityProfiles = [:]
       appendConsole(.graphics, .success, "DXMT installed")
+      await refreshSteam()
       await refreshSteamProfile()
     } catch {
       errorMessage = error.localizedDescription
@@ -592,7 +705,11 @@ final class AppModel {
   }
 
   func removeDxmt() async {
-    guard let runtimeClient else {
+    guard let runtimeClient, !isManagingDxmt else {
+      return
+    }
+    if steamIsRunning && steamStatus?.uiBackend == .dxmt {
+      errorMessage = "Stop Steam before removing DXMT because the running client is using it."
       return
     }
 
@@ -628,8 +745,8 @@ final class AppModel {
       try await settingsStore?.save(value)
       isShowingSettings = false
       compatibilityProfiles = [:]
-      await refreshWine()
-      await refreshSteamProfile()
+      await refreshRuntime()
+      await refreshSteam()
     } catch {
       errorMessage = error.localizedDescription
     }
@@ -657,11 +774,6 @@ final class AppModel {
 
   func clearConsole() {
     consoleEntries.removeAll(keepingCapacity: true)
-  }
-
-  private var normalizedWinePath: String? {
-    let value = settings.winePath.trimmingCharacters(in: .whitespacesAndNewlines)
-    return value.isEmpty ? nil : value
   }
 
   private func importedActivityKey(_ id: UUID) -> String {
@@ -696,34 +808,19 @@ final class AppModel {
     }
   }
 
-  private func beginWineManagement(
-    _ title: String,
-    stream: AsyncThrowingStream<RuntimeEvent, Error>
+  private func updateProgress(
+    from event: RuntimeEvent,
+    target: inout OperationProgressState?
   ) {
-    isManagingWine = true
-    wineManagementTitle = title
-    appendConsole(.wine, .info, title)
-    wineTask = Task {
-      defer {
-        isManagingWine = false
-        wineManagementTitle = ""
-        wineTask = nil
-        Task {
-          await refreshWine()
-          await refreshSteam()
-        }
-      }
-      do {
-        for try await event in stream {
-          consume(event, component: .wine)
-        }
-        appendConsole(.wine, .success, "\(title) completed")
-      } catch is CancellationError {
-      } catch {
-        appendConsole(.wine, .error, error.localizedDescription)
-        errorMessage = error.localizedDescription
-      }
-    }
+    guard event.kind == "progress" || event.kind.hasSuffix("_progress") else { return }
+    target = OperationProgressState(
+      phase: event.phase ?? target?.phase ?? "Working",
+      message: event.message ?? target?.message ?? "Working…",
+      progress: event.progress,
+      overallProgress: event.overallProgress,
+      currentBytes: event.currentBytes,
+      totalBytes: event.totalBytes
+    )
   }
 
   private func consume(_ event: RuntimeEvent, component: ConsoleComponent) {
@@ -737,8 +834,10 @@ final class AppModel {
       }
     case "already_running", "reusing_running":
       appendConsole(component, .info, event.message ?? "Steam is already running")
-    case "restarting_ui":
+    case "restarting_ui", "backend_switch":
       appendConsole(component, .info, event.message ?? "Restarting Steam UI")
+    case "ui_graphics":
+      appendConsole(.graphics, .success, event.message ?? "Steam UI graphics configured")
     case "log":
       let level: ConsoleLevel = event.stream == "stderr" ? .warning : .info
       appendConsole(component, level, event.message ?? "")

@@ -5,7 +5,7 @@ import XCTest
 final class SteamModelsTests: XCTestCase {
   func testDecodesSteamStatus() throws {
     let data = Data(
-      #"{"installed":true,"running":true,"prefix":"/tmp/steam","steamPath":"/tmp/steam/steam.exe","gamesInstalled":2}"#
+      #"{"installed":true,"running":true,"prefix":"/tmp/steam","steamPath":"/tmp/steam/steam.exe","gamesInstalled":2,"uiPolicyCurrent":true,"uiBackend":"dxmt","uiDxmtVersion":"v0.80","uiBackendVerified":false,"prefixRuntimeCompatible":false,"prefixRuntimeVersion":"wine-11.0"}"#
         .utf8)
     let status = try JSONDecoder().decode(SteamStatus.self, from: data)
 
@@ -13,8 +13,12 @@ final class SteamModelsTests: XCTestCase {
     XCTAssertTrue(status.running)
     XCTAssertEqual(status.gamesInstalled, 2)
     XCTAssertTrue(status.uiPolicyCurrent)
+    XCTAssertEqual(status.uiBackend, .dxmt)
+    XCTAssertEqual(status.uiDxmtVersion, "v0.80")
+    XCTAssertFalse(status.uiBackendVerified)
+    XCTAssertFalse(status.prefixRuntimeCompatible)
+    XCTAssertEqual(status.prefixRuntimeVersion, "wine-11.0")
   }
-
 
   func testDecodesSteamUiPolicyMismatch() throws {
     let data = Data(
@@ -62,13 +66,13 @@ final class SteamModelsTests: XCTestCase {
   }
   func testDecodesWineProbeFailure() throws {
     let data = Data(
-      #"{"installed":true,"ready":false,"winePath":"/Applications/Wine Stable.app/Contents/Resources/wine/bin/wine","wineVersion":null,"probeError":"process failed: command exited with -1","homebrewInstalled":true,"homebrewPath":"/opt/homebrew/bin/brew","managedByHomebrew":true}"#
+      #"{"installed":true,"ready":false,"runtimeId":"darwinwine-10.20-dp1","runtimeName":"DarwinWine","winePath":"/tmp/darwinwine/bin/wine","wineVersion":null,"darwinWineVersion":"10.20-dp1","architecture":"x86_64","channel":"experimental","steamValidated":false,"steamLoginValidated":false,"probeError":"process failed"}"#
         .utf8)
-    let status = try JSONDecoder().decode(WineStatus.self, from: data)
+    let status = try JSONDecoder().decode(DarwinWineStatus.self, from: data)
 
     XCTAssertTrue(status.installed)
     XCTAssertFalse(status.ready)
-    XCTAssertEqual(status.probeError, "process failed: command exited with -1")
+    XCTAssertEqual(status.probeError, "process failed")
   }
 
 }

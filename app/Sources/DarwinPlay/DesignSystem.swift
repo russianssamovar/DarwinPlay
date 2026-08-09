@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 enum DarwinPalette {
@@ -389,6 +390,96 @@ struct RuntimeConsoleView: View {
     case .warning: DarwinPalette.warning
     case .error: DarwinPalette.danger
     }
+  }
+}
+
+struct OperationProgressView: View {
+  let state: OperationProgressState
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 7) {
+      HStack(spacing: 8) {
+        Text(state.phase.uppercased())
+          .font(.system(size: 9, weight: .bold))
+          .tracking(1.1)
+          .foregroundStyle(DarwinPalette.accentSoft)
+        Spacer()
+        if let overall = state.overallProgress {
+          percentageText(overall)
+        } else if let progress = state.progress {
+          percentageText(progress)
+        }
+      }
+
+      if let overall = state.overallProgress {
+        ProgressView(value: overall.clamped(to: 0...1))
+          .progressViewStyle(.linear)
+          .tint(DarwinPalette.accent)
+      } else if let progress = state.progress {
+        ProgressView(value: progress.clamped(to: 0...1))
+          .progressViewStyle(.linear)
+          .tint(DarwinPalette.accent)
+      } else {
+        ProgressView()
+          .progressViewStyle(.linear)
+          .tint(DarwinPalette.accent)
+      }
+
+      if let progress = state.progress, state.overallProgress != nil,
+        state.currentBytes != nil
+      {
+        HStack(spacing: 8) {
+          Text("CURRENT DOWNLOAD")
+            .font(.system(size: 8.5, weight: .bold))
+            .tracking(0.9)
+            .foregroundStyle(DarwinPalette.textTertiary)
+          Spacer()
+          percentageText(progress, size: 9.5)
+        }
+        ProgressView(value: progress.clamped(to: 0...1))
+          .progressViewStyle(.linear)
+          .tint(DarwinPalette.accentSoft)
+      }
+
+      HStack(alignment: .firstTextBaseline, spacing: 8) {
+        Text(state.message)
+          .font(.system(size: 10.5))
+          .foregroundStyle(DarwinPalette.textSecondary)
+          .lineLimit(2)
+        Spacer(minLength: 8)
+        if let bytesText {
+          Text(bytesText)
+            .font(.system(size: 9.5, design: .monospaced))
+            .foregroundStyle(DarwinPalette.textTertiary)
+        }
+      }
+    }
+    .padding(10)
+    .background(DarwinPalette.surface.opacity(0.72), in: RoundedRectangle(cornerRadius: 10))
+  }
+
+  private func percentageText(_ value: Double, size: CGFloat = 10.5) -> some View {
+    Text("\(Int((value.clamped(to: 0...1) * 100).rounded()))%")
+      .font(.system(size: size, weight: .semibold, design: .monospaced))
+      .foregroundStyle(DarwinPalette.textSecondary)
+  }
+
+  private var bytesText: String? {
+    guard let current = state.currentBytes else { return nil }
+    let formatter = ByteCountFormatter()
+    formatter.countStyle = .file
+    formatter.allowedUnits = [.useMB, .useGB]
+    formatter.includesUnit = true
+    formatter.isAdaptive = true
+    let currentText = formatter.string(fromByteCount: Int64(current))
+    guard let total = state.totalBytes, total > 0 else { return currentText }
+    return "\(currentText) / \(formatter.string(fromByteCount: Int64(total)))"
+  }
+}
+
+extension Comparable {
+  fileprivate func clamped(to limits: ClosedRange<Self>) -> Self {
+    min(max(self, limits.lowerBound), limits.upperBound)
   }
 }
 

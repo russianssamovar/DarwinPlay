@@ -13,7 +13,7 @@ mod wine;
 use clap::Parser;
 use cli::{
     BackendOverrideArg, Cli, Command, DxmtCommand, DxmtModeArg, GraphicsBackendArg,
-    GraphicsCommand, PrefixCommand, SteamCommand, SteamProfileCommand, WineCommand,
+    GraphicsCommand, PrefixCommand, RuntimeCommand, SteamCommand, SteamProfileCommand,
 };
 use compatibility::BackendOverride;
 use error::Result;
@@ -22,7 +22,7 @@ use graphics::{DxmtMode, GraphicsBackend, GraphicsManager};
 use pe::inspect_pe;
 use prefix::PrefixManager;
 use steam::SteamManager;
-use wine::{manage_wine, wine_status, WineManagedAction, WineRuntime};
+use wine::{install_darwinwine, remove_darwinwine, runtime_status, WineRuntime};
 
 impl From<GraphicsBackendArg> for GraphicsBackend {
     fn from(value: GraphicsBackendArg) -> Self {
@@ -62,7 +62,7 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Doctor { json } => {
-            let runtime = WineRuntime::discover(cli.wine.as_deref())?;
+            let runtime = WineRuntime::discover()?;
             let report = runtime.doctor()?;
             if json {
                 write_json(&report)?;
@@ -73,21 +73,32 @@ fn run() -> Result<()> {
                 println!("Wine architecture: {}", report.wine_architecture);
             }
         }
-        Command::Wine { command } => match command {
-            WineCommand::Status { json } => {
-                let status = wine_status(cli.wine.as_deref());
+        Command::Runtime { command } => match command {
+            RuntimeCommand::Status { json } => {
+                let status = runtime_status();
                 if json {
                     write_json(&status)?;
+                } else if status.ready {
+                    println!("DarwinWine: {}", status.darwin_wine_version.as_deref().unwrap_or("unknown"));
+                    println!("Wine: {}", status.wine_version.as_deref().unwrap_or("unknown"));
                 } else if status.installed {
-                    println!("Wine installed: {}", status.wine_path.as_deref().unwrap_or("unknown"));
-                    println!("Version: {}", status.wine_version.as_deref().unwrap_or("unknown"));
+                    println!("DarwinWine is installed but not ready");
+                    if let Some(error) = status.probe_error { println!("{error}"); }
                 } else {
-                    println!("Wine is not installed");
+                    println!("DarwinWine is not installed");
                 }
             }
-            WineCommand::Install { json } => manage_wine(WineManagedAction::Install, json)?,
-            WineCommand::Reinstall { json } => manage_wine(WineManagedAction::Reinstall, json)?,
-            WineCommand::Remove { json } => manage_wine(WineManagedAction::Remove, json)?,
+            RuntimeCommand::Install { archive, json } => {
+                let status = install_darwinwine(&archive, json)?;
+                if !json {
+                    println!("DarwinWine: {}", status.darwin_wine_version.as_deref().unwrap_or("unknown"));
+                    println!("Wine: {}", status.wine_version.as_deref().unwrap_or("unknown"));
+                }
+            }
+            RuntimeCommand::Remove { json } => {
+                remove_darwinwine()?;
+                if json { write_json(&runtime_status())?; }
+            }
         },
         Command::Inspect { executable, json } => {
             let report = inspect_pe(&executable)?;
@@ -112,13 +123,15 @@ fn run() -> Result<()> {
         }
         Command::Prefix { command } => match command {
             PrefixCommand::Create { game_id } => {
-                let runtime = WineRuntime::discover(cli.wine.as_deref())?;
+                let runtime = WineRuntime::discover()?;
                 let path = prefixes.ensure(&runtime, &game_id)?;
                 println!("{}", path.display());
             }
             PrefixCommand::Reset { game_id } => {
-                if let Ok(runtime) = WineRuntime::discover(cli.wine.as_deref()) {
-                    let _ = runtime.stop_prefix(&prefixes.path(&game_id)?);
+                if let Ok(runtime) = WineRuntime::discover() {
+                    if prefixes.runtime_compatible(&runtime, &game_id).unwrap_or(false) {
+                        let _ = runtime.stop_prefix(&prefixes.path(&game_id)?);
+                    }
                 }
                 prefixes.reset(&game_id)?;
             }
@@ -144,12 +157,23 @@ fn run() -> Result<()> {
                         println!("DXMT installed: {}", status.root.as_deref().unwrap_or("unknown"));
                     }
                 }
+                DxmtCommand::InstallLatest { json } | DxmtCommand::Update { json } => {
+                    let status = graphics.install_latest_dxmt()?;
+                    if json {
+                        write_json(&status)?;
+                    } else {
+                        println!("DXMT installed: {}", status.root.as_deref().unwrap_or("unknown"));
+                        if let Some(version) = status.version.as_deref() {
+                            println!("Version: {version}");
+                        }
+                    }
+                }
                 DxmtCommand::Remove => graphics.remove_dxmt()?,
             },
         },
         Command::Steam { command } => match command {
             SteamCommand::Status { json } => {
-                let runtime = WineRuntime::discover(cli.wine.as_deref()).ok();
+                let runtime = WineRuntime::discover().ok();
                 let status = steam.status(runtime.as_ref())?;
                 if json {
                     write_json(&status)?;
@@ -157,16 +181,20 @@ fn run() -> Result<()> {
                     println!("Steam installed: {}", status.steam_path.as_deref().unwrap_or("unknown"));
                     println!("Steam running: {}", status.running);
                     println!("Installed games: {}", status.games_installed);
+                    if let Some(backend) = status.ui_backend {
+                        println!("Steam UI backend: {:?}", backend);
+                    }
+                    if let Some(version) = status.ui_dxmt_version.as_deref() {
+                        println!("Steam UI DXMT: {version}");
+                    }
                 } else {
                     println!("Steam is not installed");
                 }
             }
             SteamCommand::Install { installer, json } => {
-                let runtime = WineRuntime::discover(cli.wine.as_deref())?;
-                let status = steam.install(&runtime, &graphics, installer.as_deref())?;
-                if json {
-                    write_json(&status)?;
-                } else {
+                let runtime = WineRuntime::discover()?;
+                let status = steam.install(&runtime, &graphics, installer.as_deref(), json)?;
+                if !json {
                     println!("Steam installed: {}", status.steam_path.as_deref().unwrap_or("unknown"));
                 }
             }
@@ -189,22 +217,34 @@ fn run() -> Result<()> {
                     println!("CEF log: {}", diagnostics.cef_log_path.as_deref().unwrap_or("missing"));
                     println!("CEF --disable-gpu observed: {}", diagnostics.disable_gpu_observed);
                     println!("CEF --disable-gpu-compositing observed: {}", diagnostics.disable_gpu_compositing_observed);
+                    println!("Steam GPU acceleration registry setting disabled: {}", diagnostics.registry_gpu_acceleration_disabled);
                     println!("Vulkan mentioned in CEF/WebHelper logs: {}", diagnostics.vulkan_observed);
+                    println!("DXMT log detected: {}", diagnostics.dxmt_log_detected);
+                    if let Some(backend) = diagnostics.session_backend {
+                        println!("Recorded Steam UI backend: {:?}", backend);
+                    }
+                    if let Some(version) = diagnostics.session_dxmt_version.as_deref() {
+                        println!("Recorded DXMT version: {version}");
+                    }
+                    println!("DXMT activation: {}", diagnostics.dxmt_activation_state);
+                    if let Some(path) = diagnostics.dxmt_log_path.as_deref() {
+                        println!("DXMT log path: {path}");
+                    }
                     if let Some(command_line) = diagnostics.webhelper_command_line {
                         println!("WebHelper command line: {command_line}");
                     }
                 }
             }
             SteamCommand::Start { backend, json } => {
-                let runtime = WineRuntime::discover(cli.wine.as_deref())?;
+                let runtime = WineRuntime::discover()?;
                 steam.start(&runtime, &graphics, backend.into(), json)?;
             }
             SteamCommand::Restart { backend, json } => {
-                let runtime = WineRuntime::discover(cli.wine.as_deref())?;
+                let runtime = WineRuntime::discover()?;
                 steam.restart(&runtime, &graphics, backend.into(), json)?;
             }
             SteamCommand::Run { app_id, backend, json } => {
-                let runtime = WineRuntime::discover(cli.wine.as_deref())?;
+                let runtime = WineRuntime::discover()?;
                 steam.launch_game(&runtime, &graphics, app_id, backend.into(), json)?;
             }
             SteamCommand::Profile { command } => match command {
@@ -256,11 +296,11 @@ fn run() -> Result<()> {
                 }
             },
             SteamCommand::Stop => {
-                let runtime = WineRuntime::discover(cli.wine.as_deref())?;
+                let runtime = WineRuntime::discover()?;
                 steam.stop(&runtime)?;
             }
             SteamCommand::Reset => {
-                let runtime = WineRuntime::discover(cli.wine.as_deref())?;
+                let runtime = WineRuntime::discover()?;
                 steam.reset(&runtime)?;
             }
         },
@@ -270,7 +310,7 @@ fn run() -> Result<()> {
             backend,
             json,
         } => {
-            let runtime = WineRuntime::discover(cli.wine.as_deref())?;
+            let runtime = WineRuntime::discover()?;
             let report = inspect_pe(&executable)?;
             let prefix = prefixes.ensure(&runtime, &game_id)?;
             prefixes.bind_game_drive(&prefix, &executable)?;
@@ -279,7 +319,7 @@ fn run() -> Result<()> {
             runtime.launch(&prefix, &executable, json, &launch_graphics)?;
         }
         Command::Stop { game_id } => {
-            let runtime = WineRuntime::discover(cli.wine.as_deref())?;
+            let runtime = WineRuntime::discover()?;
             let prefix = prefixes.path(&game_id)?;
             runtime.stop_prefix(&prefix)?;
         }

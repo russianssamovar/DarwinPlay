@@ -24,7 +24,8 @@ struct DashboardView: View {
   }
 
   private var needsSetup: Bool {
-    model.wineStatus?.ready != true || model.steamStatus?.installed != true
+    model.runtimeStatus?.ready != true
+      || model.steamStatus?.installed != true
   }
 
   @ViewBuilder
@@ -41,22 +42,18 @@ struct DashboardView: View {
 
       HStack(alignment: .top, spacing: 18) {
         setupCard(
-          title: "Wine Runtime",
-          subtitle: "Windows compatibility layer",
+          title: "DarwinWine Runtime",
+          subtitle: "DarwinWine cx26.3-dp5 or newer",
           step: 1,
-          ready: model.wineStatus?.ready == true,
+          ready: model.runtimeStatus?.ready == true,
           enabled: true,
-          actionTitle: wineActionTitle,
+          actionTitle: runtimeActionTitle,
           symbol: "wineglass.fill"
         ) {
-          if model.wineStatus?.ready == true {
+          if model.runtimeStatus?.ready == true {
             model.isShowingSettings = true
-          } else if model.wineStatus?.installed == true {
-            model.openWineApplication()
-          } else if model.wineStatus?.homebrewInstalled == true {
-            model.installWine()
           } else {
-            model.openHomebrewWebsite()
+            Task { await model.installDarwinWine() }
           }
         }
 
@@ -64,8 +61,8 @@ struct DashboardView: View {
           title: "Steam for Windows",
           subtitle: "Your Windows game library",
           step: 2,
-          ready: model.steamStatus?.installed == true,
-          enabled: model.wineStatus?.ready == true,
+          ready: model.runtimeStatus?.ready == true && model.steamStatus?.installed == true,
+          enabled: model.runtimeStatus?.ready == true,
           actionTitle: model.steamStatus?.installed == true
             ? "Manage in Settings" : "Install Steam",
           symbol: "gamecontroller.fill"
@@ -78,20 +75,20 @@ struct DashboardView: View {
         }
       }
 
-      if model.wineStatus?.installed == true, model.wineStatus?.ready != true {
-        wineAttentionPanel
+      if model.runtimeStatus?.installed == true, model.runtimeStatus?.ready != true {
+        darwinWineAttentionPanel
       }
 
       HStack(spacing: 18) {
         statusLine(
-          title: "Wine",
-          detail: wineStatusDetail,
-          ready: model.wineStatus?.ready == true
+          title: "Runtime",
+          detail: runtimeStatusDetail,
+          ready: model.runtimeStatus?.ready == true
         )
         statusLine(
           title: "Steam",
           detail: steamStatusDetail,
-          ready: model.steamStatus?.installed == true
+          ready: model.runtimeStatus?.ready == true && model.steamStatus?.installed == true
         )
         Spacer()
       }
@@ -99,20 +96,11 @@ struct DashboardView: View {
     .frame(maxWidth: 1060, alignment: .leading)
   }
 
-  private var wineActionTitle: String {
-    if model.wineStatus?.ready == true {
-      return "Manage in Settings"
-    }
-    if model.wineStatus?.installed == true {
-      return "Open Wine"
-    }
-    if model.isManagingWine {
-      return model.wineManagementTitle
-    }
-    if model.wineStatus?.homebrewInstalled == true {
-      return "Install Wine"
-    }
-    return "Get Homebrew"
+  private var runtimeActionTitle: String {
+    if model.runtimeStatus?.ready == true { return "Manage in Settings" }
+    if model.isManagingDarwinWine { return "Installing Runtime…" }
+    if model.runtimeStatus?.installed == true { return "Reinstall Runtime" }
+    return "Install Runtime"
   }
 
   private func setupCard(
@@ -163,7 +151,9 @@ struct DashboardView: View {
 
         Button(action: action) {
           HStack(spacing: 8) {
-            if (step == 1 && model.isManagingWine) || (step == 2 && model.isInstallingSteam) {
+            if (step == 1 && model.isManagingDarwinWine)
+              || (step == 2 && model.isInstallingSteam)
+            {
               ProgressView().controlSize(.small)
             }
             Text(actionTitle)
@@ -171,7 +161,15 @@ struct DashboardView: View {
           .frame(maxWidth: .infinity)
         }
         .buttonStyle(ActionButtonStyle(emphasized: !ready))
-        .disabled(!enabled || model.isInstallingSteam || model.isManagingWine)
+        .disabled(
+          !enabled || model.isInstallingSteam || model.isManagingDarwinWine
+        )
+
+        if step == 1, let progress = model.darwinWineProgress {
+          OperationProgressView(state: progress)
+        } else if step == 2, let progress = model.steamInstallProgress {
+          OperationProgressView(state: progress)
+        }
       }
       .padding(16)
     }
@@ -185,21 +183,21 @@ struct DashboardView: View {
     .opacity(enabled || ready ? 1 : 0.48)
   }
 
-  private var wineAttentionPanel: some View {
+  private var darwinWineAttentionPanel: some View {
     SurfaceCard(padding: 18) {
       HStack(alignment: .top, spacing: 16) {
-        Image(systemName: "exclamationmark.shield")
-          .font(.system(size: 22, weight: .medium))
+        Image(systemName: "wrench.and.screwdriver.fill")
+          .font(.system(size: 20, weight: .medium))
           .foregroundStyle(DarwinPalette.warning)
           .frame(width: 32)
 
         VStack(alignment: .leading, spacing: 7) {
-          Text("Wine is installed, but its command-line runtime is not ready")
+          Text("DarwinWine needs reinstall")
             .font(.system(size: 14, weight: .semibold))
             .foregroundStyle(DarwinPalette.textPrimary)
           Text(
-            model.wineStatus?.probeError
-              ?? "DarwinPlay could not complete the Wine readiness probe."
+            model.runtimeStatus?.probeError
+              ?? "The installed DarwinWine runtime did not pass validation."
           )
           .font(.system(size: 11.5, design: .monospaced))
           .foregroundStyle(DarwinPalette.textSecondary)
@@ -209,22 +207,13 @@ struct DashboardView: View {
 
         Spacer(minLength: 18)
 
-        HStack(spacing: 8) {
-          Button("Open Wine") {
-            model.openWineApplication()
-          }
-          .buttonStyle(SecondaryActionButtonStyle())
-
-          Button("Privacy & Security") {
-            model.openPrivacyAndSecurity()
-          }
-          .buttonStyle(SecondaryActionButtonStyle())
-
-          Button("Try Again") {
-            model.retryWineProbe()
-          }
-          .buttonStyle(PrimaryActionButtonStyle())
+        Button {
+          Task { await model.installDarwinWine() }
+        } label: {
+          Text(model.isManagingDarwinWine ? "Installing…" : "Reinstall Runtime")
         }
+        .buttonStyle(PrimaryActionButtonStyle())
+        .disabled(model.isManagingDarwinWine || model.steamIsRunning)
       }
     }
   }
@@ -311,18 +300,19 @@ struct DashboardView: View {
       SectionHeading("Runtime")
       HStack(spacing: 12) {
         statusLine(
-          title: "Wine",
-          detail: wineStatusDetail,
-          ready: model.wineStatus?.ready == true
+          title: "Runtime",
+          detail: runtimeStatusDetail,
+          ready: model.runtimeStatus?.ready == true
         )
         statusLine(
           title: "Steam",
           detail: steamStatusDetail,
-          ready: model.steamStatus?.installed == true
+          ready: model.runtimeStatus?.ready == true && model.steamStatus?.installed == true
         )
         statusLine(
           title: "DXMT",
-          detail: model.dxmtStatus?.installed == true ? "Ready" : "Optional",
+          detail: model.dxmtStatus?.installed == true
+            ? (model.dxmtStatus?.version ?? "Ready") : "Optional",
           ready: model.dxmtStatus?.installed == true
         )
         Spacer()
@@ -331,19 +321,20 @@ struct DashboardView: View {
   }
 
   private var steamStatusDetail: String {
+    if model.runtimeStatus?.ready != true {
+      return model.steamStatus?.installed == true ? "Waiting for runtime" : "Not installed"
+    }
     if model.steamIsRunning {
       return "Running"
     }
     return model.steamStatus?.installed == true ? "Ready" : "Not installed"
   }
 
-  private var wineStatusDetail: String {
-    if let version = model.wineStatus?.wineVersion {
-      return version
+  private var runtimeStatusDetail: String {
+    if model.runtimeStatus?.ready == true {
+      return model.runtimeStatus?.darwinWineVersion ?? model.runtimeStatus?.wineVersion ?? "Ready"
     }
-    if model.wineStatus?.installed == true {
-      return "Needs attention"
-    }
+    if model.runtimeStatus?.installed == true { return "Needs reinstall" }
     return "Not installed"
   }
 

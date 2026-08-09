@@ -5,14 +5,14 @@ import SwiftUI
 struct SettingsView: View {
   @Environment(\.dismiss) private var dismiss
   @Bindable var model: AppModel
-  @State private var winePath: String
   @State private var graphicsBackend: GraphicsBackendPreference
+  @State private var steamUiBackend: GraphicsBackendPreference
   @State private var dxmtMode: DxmtMode = .builtin
 
   init(model: AppModel) {
     self.model = model
-    _winePath = State(initialValue: model.settings.winePath)
     _graphicsBackend = State(initialValue: model.settings.graphicsBackend)
+    _steamUiBackend = State(initialValue: model.settings.steamUiBackend)
   }
 
   var body: some View {
@@ -25,7 +25,6 @@ struct SettingsView: View {
           VStack(alignment: .leading, spacing: 24) {
             runtimeSection
             graphicsSection
-            advancedSection
           }
           .padding(24)
         }
@@ -43,7 +42,7 @@ struct SettingsView: View {
         Text("Settings")
           .font(.system(size: 22, weight: .semibold))
           .foregroundStyle(DarwinPalette.textPrimary)
-        Text("Runtime management and compatibility defaults")
+        Text("DarwinWine, Steam, and graphics")
           .font(.system(size: 11.5))
           .foregroundStyle(DarwinPalette.textSecondary)
       }
@@ -62,97 +61,119 @@ struct SettingsView: View {
 
   private var runtimeSection: some View {
     VStack(alignment: .leading, spacing: 12) {
-      SectionHeading("Runtimes", subtitle: "Install once on Home, manage them here afterwards")
+      SectionHeading("Runtime", subtitle: "DarwinPlay uses DarwinWine exclusively")
       VStack(spacing: 10) {
-        wineRuntimeCard
+        darwinWineCard
         steamRuntimeCard
       }
     }
   }
 
-  private var wineStatusLabel: String {
-    if model.wineStatus?.ready == true { return "READY" }
-    if model.wineStatus?.installed == true { return "APPROVAL REQUIRED" }
-    return "NOT INSTALLED"
-  }
+  private var darwinWineCard: some View {
+    let status = model.runtimeStatus
+    let ready = status?.ready == true
+    let installed = status?.installed == true
 
-  private var wineRuntimeCard: some View {
-    SurfaceCard {
+    return SurfaceCard {
       HStack(alignment: .top, spacing: 14) {
         DarwinMark(size: 42)
         VStack(alignment: .leading, spacing: 5) {
           HStack(spacing: 8) {
-            Text("Wine")
+            Text("DarwinWine")
               .font(.system(size: 15, weight: .semibold))
               .foregroundStyle(DarwinPalette.textPrimary)
             StatusPill(
-              wineStatusLabel,
-              tone: model.wineStatus?.ready == true ? .success : .warning
+              ready ? "READY" : (installed ? "NEEDS REINSTALL" : "NOT INSTALLED"),
+              tone: ready ? .success : .warning
             )
           }
-          Text(model.wineStatus?.wineVersion ?? "Windows compatibility runtime")
+
+          Text(status?.darwinWineVersion ?? "DarwinWine cx26.3-dp5 or newer")
             .font(.system(size: 11.5))
             .foregroundStyle(DarwinPalette.textSecondary)
-          if let path = model.wineStatus?.winePath {
+
+          if let wineVersion = status?.wineVersion {
+            Text(
+              "Wine \(wineVersion) · \(status?.architecture ?? "unknown") · \(status?.channel ?? "unknown")"
+            )
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundStyle(DarwinPalette.textTertiary)
+          }
+
+          if ready {
+            HStack(spacing: 10) {
+              Label(
+                status?.steamValidated == true ? "Steam verified" : "Steam validation pending",
+                systemImage: status?.steamValidated == true ? "checkmark.seal.fill" : "clock"
+              )
+              Label(
+                status?.steamLoginValidated == true ? "Login verified" : "Login validation pending",
+                systemImage: status?.steamLoginValidated == true ? "checkmark.seal.fill" : "clock"
+              )
+            }
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundStyle(DarwinPalette.textTertiary)
+          }
+
+          if let path = status?.winePath {
             Text(path)
               .font(.system(size: 10, design: .monospaced))
               .foregroundStyle(DarwinPalette.textTertiary)
               .textSelection(.enabled)
               .lineLimit(2)
           }
-          if model.wineStatus?.ready != true, let error = model.wineStatus?.probeError {
+
+          if let error = status?.probeError, !ready {
             Text(error)
               .font(.system(size: 10, design: .monospaced))
               .foregroundStyle(DarwinPalette.warning)
               .textSelection(.enabled)
-              .lineLimit(3)
+              .lineLimit(4)
+          }
+
+          if let progress = model.darwinWineProgress {
+            OperationProgressView(state: progress)
+              .padding(.top, 5)
           }
         }
+
         Spacer(minLength: 12)
 
-        if model.wineStatus?.installed == true, model.wineStatus?.ready != true {
-          HStack(spacing: 8) {
-            Button("Open Wine") {
-              model.openWineApplication()
-            }
-            .buttonStyle(SecondaryActionButtonStyle())
-
-            Button("Privacy & Security") {
-              model.openPrivacyAndSecurity()
-            }
-            .buttonStyle(SecondaryActionButtonStyle())
-
-            Button("Try Again") {
-              model.retryWineProbe()
-            }
-            .buttonStyle(PrimaryActionButtonStyle())
+        HStack(spacing: 8) {
+          if ready {
+            darwinWineInstallButton(installed: installed)
+              .buttonStyle(SecondaryActionButtonStyle())
+          } else {
+            darwinWineInstallButton(installed: installed)
+              .buttonStyle(PrimaryActionButtonStyle())
           }
-        } else if model.wineStatus?.installed == true, model.wineStatus?.managedByHomebrew == true {
-          HStack(spacing: 8) {
-            Button {
-              model.reinstallWine()
-            } label: {
-              Text(model.isManagingWine ? model.wineManagementTitle : "Reinstall")
-            }
-            .buttonStyle(SecondaryActionButtonStyle())
-            .disabled(model.isManagingWine)
 
+          if installed {
             Button(role: .destructive) {
-              model.removeWine()
+              Task { await model.removeDarwinWine() }
             } label: {
               Text("Remove")
             }
             .buttonStyle(SecondaryActionButtonStyle())
             .disabled(
-              model.isManagingWine || model.steamIsRunning || !model.runningGameIDs.isEmpty)
+              model.isManagingDarwinWine || model.steamIsRunning || !model.runningGameIDs.isEmpty)
           }
-        } else if model.wineStatus?.installed != true {
-          Text("Use Home to complete setup")
-            .font(.system(size: 11))
-            .foregroundStyle(DarwinPalette.textTertiary)
         }
       }
     }
+  }
+
+  private func darwinWineInstallButton(installed: Bool) -> some View {
+    Button {
+      Task { await model.installDarwinWine() }
+    } label: {
+      Text(
+        model.isManagingDarwinWine
+          ? "Installing…" : (installed ? "Install Update…" : "Install Runtime…"))
+    }
+    .disabled(
+      model.isManagingDarwinWine || model.steamIsRunning || !model.runningGameIDs.isEmpty
+    )
   }
 
   private var steamRuntimeCard: some View {
@@ -170,10 +191,14 @@ struct SettingsView: View {
               .font(.system(size: 15, weight: .semibold))
               .foregroundStyle(DarwinPalette.textPrimary)
             StatusPill(
-              model.steamIsRunning
-                ? "RUNNING"
-                : (model.steamStatus?.installed == true ? "READY" : "NOT INSTALLED"),
-              tone: model.steamStatus?.installed == true ? .success : .neutral
+              model.steamStatus?.prefixRuntimeCompatible == false
+                ? "RUNTIME RESET REQUIRED"
+                : (model.steamIsRunning
+                  ? "RUNNING"
+                  : (model.steamStatus?.installed == true ? "READY" : "NOT INSTALLED")),
+              tone:
+                model.steamStatus?.prefixRuntimeCompatible == false
+                ? .warning : (model.steamStatus?.installed == true ? .success : .neutral)
             )
           }
           Text(
@@ -183,11 +208,21 @@ struct SettingsView: View {
           )
           .font(.system(size: 11.5))
           .foregroundStyle(DarwinPalette.textSecondary)
+          if model.steamStatus?.installed == true,
+            model.steamStatus?.prefixRuntimeCompatible == false
+          {
+            Text(
+              "Prefix runtime · \(model.steamStatus?.prefixRuntimeVersion ?? "unknown") · DarwinWine \(model.runtimeStatus?.wineVersion ?? "unknown"). Reset the Steam prefix after a runtime-incompatible update."
+            )
+            .font(.system(size: 10.5))
+            .foregroundStyle(DarwinPalette.warning)
+            .fixedSize(horizontal: false, vertical: true)
+          }
           if model.steamStatus?.installed == true {
             Text(
               model.steamUiRestartRequired
-                ? "Web UI · restart required for current compatibility policy"
-                : "Web UI · software rendering"
+                ? "UI renderer · restart required"
+                : "UI renderer · \(steamUiBackendDescription)"
             )
             .font(.system(size: 10.5, weight: .medium))
             .foregroundStyle(
@@ -201,12 +236,24 @@ struct SettingsView: View {
               .textSelection(.enabled)
               .lineLimit(2)
           }
+
+          if let progress = model.steamInstallProgress {
+            OperationProgressView(state: progress)
+              .padding(.top, 5)
+          }
         }
         Spacer(minLength: 12)
 
         if model.steamStatus?.installed == true {
           HStack(spacing: 8) {
             if model.steamIsRunning {
+              Button {
+                Task { await model.stopSteam() }
+              } label: {
+                Text("Stop")
+              }
+              .buttonStyle(SecondaryActionButtonStyle())
+
               Button {
                 model.restartSteamUI()
               } label: {
@@ -220,6 +267,7 @@ struct SettingsView: View {
                 Text("Open")
               }
               .buttonStyle(SecondaryActionButtonStyle())
+              .disabled(model.steamStatus?.prefixRuntimeCompatible == false)
             }
 
             Button(role: .destructive) {
@@ -243,7 +291,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 17) {
           HStack {
             VStack(alignment: .leading, spacing: 3) {
-              Text("Default backend")
+              Text("Default game backend")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(DarwinPalette.textPrimary)
               Text("Automatic prefers DXMT for supported D3D10/11 games.")
@@ -251,7 +299,26 @@ struct SettingsView: View {
                 .foregroundStyle(DarwinPalette.textTertiary)
             }
             Spacer()
-            Picker("Default backend", selection: $graphicsBackend) {
+            Picker("Default game backend", selection: $graphicsBackend) {
+              ForEach(GraphicsBackendPreference.allCases) { backend in
+                Text(backend.displayName).tag(backend)
+              }
+            }
+            .labelsHidden()
+            .frame(width: 180)
+          }
+
+          HStack {
+            VStack(alignment: .leading, spacing: 3) {
+              Text("Steam UI backend")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(DarwinPalette.textPrimary)
+              Text("Automatic uses DXMT when installed and WineD3D otherwise.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(DarwinPalette.textTertiary)
+            }
+            Spacer()
+            Picker("Steam UI backend", selection: $steamUiBackend) {
               ForEach(GraphicsBackendPreference.allCases) { backend in
                 Text(backend.displayName).tag(backend)
               }
@@ -291,59 +358,51 @@ struct SettingsView: View {
                 Text("Remove")
               }
               .buttonStyle(SecondaryActionButtonStyle())
+              .disabled(model.isManagingDxmt || model.steamIsRunning)
             }
           }
 
-          Picker("Package mode", selection: $dxmtMode) {
-            ForEach(DxmtMode.allCases) { mode in
-              Text(mode.displayName).tag(mode)
-            }
-          }
-          .pickerStyle(.segmented)
-
-          Button {
-            chooseDxmtPackage()
-          } label: {
-            Label(
-              model.dxmtStatus?.installed == true ? "Replace DXMT Package" : "Install DXMT Package",
-              systemImage: "square.and.arrow.down"
-            )
-          }
-          .buttonStyle(SecondaryActionButtonStyle())
-        }
-      }
-    }
-  }
-
-  private var advancedSection: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      SectionHeading(
-        "Advanced", subtitle: "Override Wine discovery only when you need a custom build")
-      SurfaceCard {
-        VStack(alignment: .leading, spacing: 9) {
-          Text("Wine executable override")
-            .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(DarwinPalette.textPrimary)
           HStack(spacing: 8) {
-            TextField("Automatic", text: $winePath)
-              .textFieldStyle(.plain)
-              .font(.system(size: 11.5, design: .monospaced))
-              .padding(.horizontal, 11)
-              .frame(height: 38)
-              .background(DarwinPalette.console, in: RoundedRectangle(cornerRadius: 9))
-              .overlay {
-                RoundedRectangle(cornerRadius: 9).stroke(DarwinPalette.border, lineWidth: 1)
-              }
             Button {
-              chooseWine()
+              Task {
+                if model.dxmtStatus?.installed == true {
+                  await model.updateDxmt()
+                } else {
+                  await model.installLatestDxmt()
+                }
+              }
             } label: {
-              Label("Browse", systemImage: "folder")
+              Label(
+                model.isManagingDxmt
+                  ? "Working…"
+                  : (model.dxmtStatus?.installed == true ? "Update DXMT" : "Install Latest DXMT"),
+                systemImage: "arrow.down.circle"
+              )
+            }
+            .buttonStyle(PrimaryActionButtonStyle())
+            .disabled(model.isManagingDxmt || model.steamIsRunning)
+
+            Menu {
+              Picker("Package mode", selection: $dxmtMode) {
+                ForEach(DxmtMode.allCases) { mode in
+                  Text(mode.displayName).tag(mode)
+                }
+              }
+              Button("Install from Folder…") {
+                chooseDxmtPackage()
+              }
+            } label: {
+              Label("Manual", systemImage: "folder")
             }
             .buttonStyle(SecondaryActionButtonStyle())
+            .disabled(model.isManagingDxmt || model.steamIsRunning)
           }
-          Text("Leave empty to use managed Wine or automatic discovery.")
-            .font(.system(size: 10.5))
-            .foregroundStyle(DarwinPalette.textTertiary)
+
+          if model.steamIsRunning {
+            Text("Stop Steam before installing, updating, or removing DXMT.")
+              .font(.system(size: 10.5))
+              .foregroundStyle(DarwinPalette.warning)
+          }
         }
       }
     }
@@ -352,14 +411,15 @@ struct SettingsView: View {
   private var footer: some View {
     HStack(spacing: 8) {
       Spacer()
-      Button("Cancel") {
-        dismiss()
-      }
-      .buttonStyle(SecondaryActionButtonStyle())
+      Button("Cancel") { dismiss() }
+        .buttonStyle(SecondaryActionButtonStyle())
       Button {
         Task {
           await model.saveSettings(
-            AppSettings(winePath: winePath, graphicsBackend: graphicsBackend)
+            AppSettings(
+              graphicsBackend: graphicsBackend,
+              steamUiBackend: steamUiBackend
+            )
           )
         }
       } label: {
@@ -375,20 +435,22 @@ struct SettingsView: View {
       return "Direct3D 10/11 → Metal. WineD3D stays available without it."
     }
     let mode = status.mode?.displayName ?? "Unknown mode"
-    let source = status.sourceName ?? status.root ?? "Managed component"
-    return "\(mode) · \(source)"
+    let version = status.version ?? "custom"
+    let source =
+      status.managed ? "Managed from official release" : (status.sourceName ?? "Manual package")
+    return "\(version) · \(mode) · \(source)"
   }
 
-  private func chooseWine() {
-    let panel = NSOpenPanel()
-    panel.canChooseFiles = true
-    panel.canChooseDirectories = false
-    panel.allowsMultipleSelection = false
-    panel.resolvesAliases = true
-    panel.message = "Select the Wine executable"
-    if panel.runModal() == .OK, let url = panel.url {
-      winePath = url.path
+  private var steamUiBackendDescription: String {
+    let backend = model.steamStatus?.uiBackend ?? model.effectiveSteamUiBackend
+    if backend == .dxmt, let version = model.steamStatus?.uiDxmtVersion ?? model.dxmtStatus?.version
+    {
+      if model.steamStatus?.running == true, model.steamStatus?.uiBackendVerified == false {
+        return "DXMT \(version) requested · not confirmed"
+      }
+      return "DXMT \(version) → Metal"
     }
+    return backend.displayName
   }
 
   private func chooseDxmtPackage() {

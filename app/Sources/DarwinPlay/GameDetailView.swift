@@ -61,7 +61,7 @@ struct GameDetailView: View {
                 systemImage: "play.fill")
             }
             .buttonStyle(PrimaryActionButtonStyle())
-            .disabled(model.runningGameIDs.contains(game.id) || model.wineStatus?.ready != true)
+            .disabled(model.runningGameIDs.contains(game.id) || model.runtimeStatus?.ready != true)
 
             Button {
               model.toggleFavorite(.imported(game))

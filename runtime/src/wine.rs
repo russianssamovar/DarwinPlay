@@ -1,18 +1,28 @@
+use crate::app_dirs::application_support;
 use crate::error::{AppError, Result};
-use crate::events::{write_json, RuntimeEvent};
+use crate::events::{write_json, write_progress, RuntimeEvent};
 use crate::graphics::{GraphicsBackend, LaunchGraphics};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const HOMEBREW_WINE_CASK: &str = "wine-stable";
+const DARWINWINE_DIRECTORY: &str = "darwinwine";
+const DARWINWINE_MANIFEST: &str = "runtime.json";
+const INSTALL_PROBE_TIMEOUT: Duration = Duration::from_secs(90);
+const EXTRACTION_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(1800);
+const DARWINWINE_MANIFEST_SCHEMA: u32 = 2;
+const MIN_DARWINWINE_CX_MAJOR: u32 = 26;
+const MIN_DARWINWINE_CX_MINOR: u32 = 3;
+const MIN_DARWINWINE_DP_REVISION: u32 = 5;
 
 #[derive(Clone)]
 pub struct WineRuntime {
@@ -21,24 +31,39 @@ pub struct WineRuntime {
     version: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WineStatus {
-    pub installed: bool,
-    pub ready: bool,
-    pub wine_path: Option<String>,
-    pub wine_version: Option<String>,
-    pub probe_error: Option<String>,
-    pub homebrew_installed: bool,
-    pub homebrew_path: Option<String>,
-    pub managed_by_homebrew: bool,
+pub struct DarwinWineManifest {
+    pub schema_version: u32,
+    pub id: String,
+    pub name: String,
+    pub wine_version: String,
+    pub darwin_wine_version: String,
+    pub architecture: String,
+    #[serde(rename = "minimumMacOS", alias = "minimumMacOs")]
+    pub minimum_mac_os: String,
+    pub channel: String,
+    pub entrypoint: String,
+    pub wineserver: String,
+    pub steam_validated: bool,
+    pub steam_login_validated: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum WineManagedAction {
-    Install,
-    Reinstall,
-    Remove,
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DarwinWineStatus {
+    pub installed: bool,
+    pub ready: bool,
+    pub runtime_id: Option<String>,
+    pub runtime_name: Option<String>,
+    pub wine_path: Option<String>,
+    pub wine_version: Option<String>,
+    pub darwin_wine_version: Option<String>,
+    pub architecture: Option<String>,
+    pub channel: Option<String>,
+    pub steam_validated: bool,
+    pub steam_login_validated: bool,
+    pub probe_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -50,72 +75,572 @@ pub struct DoctorReport {
     pub wine_architecture: String,
 }
 
-pub fn wine_status(explicit: Option<&Path>) -> WineStatus {
-    let brew = discover_homebrew();
-    let homebrew_wine_installed = brew
-        .as_ref()
-        .is_some_and(|path| homebrew_has_wine(path));
-    let candidate = discover_wine(explicit).ok();
-    let managed_by_homebrew = homebrew_wine_installed
-        && candidate
-            .as_ref()
-            .is_some_and(|path| is_homebrew_managed_wine(path));
-    match WineRuntime::discover(explicit) {
-        Ok(runtime) => WineStatus {
+pub fn runtime_status() -> DarwinWineStatus {
+    let root = match darwinwine_root() {
+        Ok(root) => root,
+        Err(error) => return missing_status(Some(error.to_string())),
+    };
+    if !root.is_dir() {
+        return missing_status(None);
+    }
+    let manifest = match load_manifest(&root) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return DarwinWineStatus {
+                installed: true,
+                ready: false,
+                runtime_id: None,
+                runtime_name: Some("DarwinWine".into()),
+                wine_path: None,
+                wine_version: None,
+                darwin_wine_version: None,
+                architecture: None,
+                channel: None,
+                steam_validated: false,
+                steam_login_validated: false,
+                probe_error: Some(error.to_string()),
+            };
+        }
+    };
+    let wine = root.join(&manifest.entrypoint);
+    match WineRuntime::discover() {
+        Ok(runtime) => DarwinWineStatus {
             installed: true,
             ready: true,
-            wine_path: Some(runtime.wine.display().to_string()),
+            runtime_id: Some(manifest.id),
+            runtime_name: Some(manifest.name),
+            wine_path: Some(wine.display().to_string()),
             wine_version: Some(runtime.version.clone()),
+            darwin_wine_version: Some(manifest.darwin_wine_version),
+            architecture: Some(manifest.architecture),
+            channel: Some(manifest.channel),
+            steam_validated: manifest.steam_validated,
+            steam_login_validated: manifest.steam_login_validated,
             probe_error: None,
-            homebrew_installed: brew.is_some(),
-            homebrew_path: brew.map(|path| path.display().to_string()),
-            managed_by_homebrew,
         },
-        Err(error) => WineStatus {
-            installed: candidate.is_some(),
+        Err(error) => DarwinWineStatus {
+            installed: true,
             ready: false,
-            wine_path: candidate.map(|path| path.display().to_string()),
+            runtime_id: Some(manifest.id),
+            runtime_name: Some(manifest.name),
+            wine_path: Some(wine.display().to_string()),
             wine_version: None,
+            darwin_wine_version: Some(manifest.darwin_wine_version),
+            architecture: Some(manifest.architecture),
+            channel: Some(manifest.channel),
+            steam_validated: manifest.steam_validated,
+            steam_login_validated: manifest.steam_login_validated,
             probe_error: Some(error.to_string()),
-            homebrew_installed: brew.is_some(),
-            homebrew_path: brew.map(|path| path.display().to_string()),
-            managed_by_homebrew,
         },
     }
 }
 
-pub fn manage_wine(action: WineManagedAction, json: bool) -> Result<()> {
-    let brew = discover_homebrew().ok_or(AppError::HomebrewNotFound)?;
-    let mut command = Command::new(&brew);
-    match action {
-        WineManagedAction::Install => {
-            command.args(["install", "--cask", HOMEBREW_WINE_CASK]);
-        }
-        WineManagedAction::Reinstall => {
-            command.args(["reinstall", "--cask", HOMEBREW_WINE_CASK]);
-        }
-        WineManagedAction::Remove => {
-            command.args(["uninstall", "--cask", HOMEBREW_WINE_CASK]);
-        }
+pub fn install_darwinwine(archive: &Path, json: bool) -> Result<DarwinWineStatus> {
+    if !archive.is_file() {
+        return Err(AppError::InvalidFile(archive.display().to_string()));
     }
-    configure_homebrew_command(&mut command);
-    stream_managed_command(command, json)?;
-    if !matches!(action, WineManagedAction::Remove) && !homebrew_has_wine(&brew) {
-        return Err(AppError::WineNotFound);
+    emit_runtime_progress(json, "Preparing", "Preparing DarwinWine runtime", None, Some(0.03))?;
+    let archive_entries = validate_archive_paths(archive)?;
+
+    let support = application_support()?;
+    let runtimes = support.join("runtime");
+    fs::create_dir_all(&runtimes)?;
+    let staging = runtimes.join(format!(".darwinwine-install-{}", std::process::id()));
+    remove_path_if_exists(&staging)?;
+    fs::create_dir_all(&staging)?;
+
+    emit_runtime_progress(json, "Extracting", "Extracting DarwinWine", None, Some(0.18))?;
+    extract_archive(archive, &staging, json, &archive_entries)?;
+    let extracted_root = find_runtime_root(&staging, 3).ok_or_else(|| {
+        AppError::Runtime("DarwinWine archive does not contain runtime.json".into())
+    })?;
+    let manifest = load_manifest(&extracted_root)?;
+    validate_manifest(&manifest)?;
+
+    emit_runtime_progress(json, "Validating", "Validating DarwinWine runtime", None, Some(0.42))?;
+    let runtime = WineRuntime::from_root(&extracted_root, &manifest)?;
+    if !runtime.version.contains(&manifest.wine_version) {
+        return Err(AppError::Runtime(format!(
+            "runtime reports {}, manifest expects Wine {}",
+            runtime.version, manifest.wine_version
+        )));
+    }
+
+    let probe_prefix = staging.join(".probe-prefix");
+    emit_runtime_progress(json, "Testing", "Creating a temporary Wine prefix", None, Some(0.62))?;
+    probe_runtime(&runtime, &probe_prefix)?;
+    remove_path_if_exists(&probe_prefix)?;
+
+    let target = darwinwine_root()?;
+    let backup = runtimes.join(".darwinwine-backup");
+    remove_path_if_exists(&backup)?;
+    if target.exists() {
+        fs::rename(&target, &backup)?;
+    }
+    emit_runtime_progress(json, "Activating", "Activating DarwinWine", None, Some(0.88))?;
+    if let Err(error) = fs::rename(&extracted_root, &target) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &target);
+        }
+        return Err(error.into());
+    }
+    remove_path_if_exists(&backup)?;
+    remove_path_if_exists(&staging)?;
+
+    let status = runtime_status();
+    if !status.ready {
+        return Err(AppError::Runtime(
+            status.probe_error.clone().unwrap_or_else(|| "DarwinWine activation failed".into()),
+        ));
+    }
+    remove_legacy_managed_wine_state(&support)?;
+    emit_runtime_progress(json, "Ready", "DarwinWine is ready", Some(1.0), Some(1.0))?;
+    Ok(status)
+}
+
+pub fn remove_darwinwine() -> Result<()> {
+    remove_path_if_exists(&darwinwine_root()?)
+}
+
+fn missing_status(error: Option<String>) -> DarwinWineStatus {
+    DarwinWineStatus {
+        installed: false,
+        ready: false,
+        runtime_id: None,
+        runtime_name: Some("DarwinWine".into()),
+        wine_path: None,
+        wine_version: None,
+        darwin_wine_version: None,
+        architecture: None,
+        channel: None,
+        steam_validated: false,
+        steam_login_validated: false,
+        probe_error: error,
+    }
+}
+
+fn darwinwine_root() -> Result<PathBuf> {
+    Ok(application_support()?.join("runtime").join(DARWINWINE_DIRECTORY))
+}
+
+fn load_manifest(root: &Path) -> Result<DarwinWineManifest> {
+    let path = root.join(DARWINWINE_MANIFEST);
+    let data = fs::read(&path).map_err(|_| {
+        AppError::Runtime(format!("DarwinWine manifest not found: {}", path.display()))
+    })?;
+    Ok(serde_json::from_slice(&data)?)
+}
+
+fn validate_manifest(manifest: &DarwinWineManifest) -> Result<()> {
+    if manifest.schema_version != DARWINWINE_MANIFEST_SCHEMA {
+        return Err(AppError::Runtime(format!(
+            "unsupported DarwinWine manifest schema {}; DarwinPlay requires schema {}",
+            manifest.schema_version, DARWINWINE_MANIFEST_SCHEMA
+        )));
+    }
+    if manifest.name != "DarwinWine" || !manifest.id.starts_with("darwinwine-") {
+        return Err(AppError::Runtime("archive is not a DarwinWine runtime".into()));
+    }
+    if manifest.architecture != "x86_64" {
+        return Err(AppError::Runtime(format!("unsupported DarwinWine architecture {}", manifest.architecture)));
+    }
+    validate_supported_darwinwine_version(&manifest.darwin_wine_version)?;
+    validate_relative_runtime_path(&manifest.entrypoint)?;
+    validate_relative_runtime_path(&manifest.wineserver)?;
+    Ok(())
+}
+
+fn validate_supported_darwinwine_version(value: &str) -> Result<()> {
+    let value_without_prefix = value
+        .strip_prefix("cx")
+        .ok_or_else(|| AppError::Runtime(format!(
+            "unsupported DarwinWine version {value}; DarwinPlay requires CrossOver-derived cx26.3-dp5 or newer"
+        )))?;
+    let (crossover, revision) = value_without_prefix
+        .split_once("-dp")
+        .ok_or_else(|| AppError::Runtime(format!("invalid DarwinWine version {value}")))?;
+    let (major, minor) = crossover
+        .split_once('.')
+        .ok_or_else(|| AppError::Runtime(format!("invalid DarwinWine version {value}")))?;
+    let major = major
+        .parse::<u32>()
+        .map_err(|_| AppError::Runtime(format!("invalid DarwinWine version {value}")))?;
+    let minor = minor
+        .parse::<u32>()
+        .map_err(|_| AppError::Runtime(format!("invalid DarwinWine version {value}")))?;
+    let revision = revision
+        .parse::<u32>()
+        .map_err(|_| AppError::Runtime(format!("invalid DarwinWine version {value}")))?;
+
+    let crossover_version = (major, minor);
+    let minimum_crossover = (MIN_DARWINWINE_CX_MAJOR, MIN_DARWINWINE_CX_MINOR);
+    if crossover_version < minimum_crossover
+        || (crossover_version == minimum_crossover && revision < MIN_DARWINWINE_DP_REVISION)
+    {
+        return Err(AppError::Runtime(format!(
+            "DarwinWine {value} is too old; DarwinPlay requires cx26.3-dp5 or newer"
+        )));
     }
     Ok(())
 }
 
+fn validate_relative_runtime_path(value: &str) -> Result<()> {
+    let path = Path::new(value);
+    if path.is_absolute() || path.components().any(|component| matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
+        return Err(AppError::Runtime(format!("invalid runtime path in manifest: {value}")));
+    }
+    Ok(())
+}
+
+fn find_runtime_root(root: &Path, depth: usize) -> Option<PathBuf> {
+    if root.join(DARWINWINE_MANIFEST).is_file() {
+        return Some(root.to_path_buf());
+    }
+    if depth == 0 { return None; }
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_runtime_root(&path, depth - 1) { return Some(found); }
+        }
+    }
+    None
+}
+
+fn validate_archive_paths(archive: &Path) -> Result<HashSet<String>> {
+    let output = Command::new("/usr/bin/tar").arg("-tf").arg(archive).output()?;
+    if !output.status.success() {
+        return Err(command_failure("tar -tf", &output));
+    }
+    let mut entries = HashSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let entry = line.trim();
+        if entry.is_empty() { continue; }
+        let path = Path::new(entry);
+        if path.is_absolute() || path.components().any(|component| matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
+            return Err(AppError::Runtime(format!("unsafe path in DarwinWine archive: {line}")));
+        }
+        entries.insert(entry.to_string());
+    }
+    if entries.is_empty() {
+        return Err(AppError::Runtime("DarwinWine archive is empty".into()));
+    }
+    Ok(entries)
+}
+
+fn extract_archive(
+    archive: &Path,
+    destination: &Path,
+    json: bool,
+    archive_entries: &HashSet<String>,
+) -> Result<()> {
+    enum TarLine { Stdout(String), Stderr(String) }
+
+    let mut child = Command::new("/usr/bin/tar")
+        .arg("-xvf").arg(archive)
+        .arg("-C").arg(destination)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child.stdout.take().ok_or_else(|| AppError::Runtime("failed to capture tar stdout".into()))?;
+    let stderr = child.stderr.take().ok_or_else(|| AppError::Runtime("failed to capture tar stderr".into()))?;
+    let (tx, rx) = mpsc::channel();
+    let stdout_tx = tx.clone();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
+            let _ = stdout_tx.send(TarLine::Stdout(line));
+        }
+    });
+    let stderr_tx = tx.clone();
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(std::result::Result::ok) {
+            let _ = stderr_tx.send(TarLine::Stderr(line));
+        }
+    });
+    drop(tx);
+
+    let total = archive_entries.len();
+    let mut extracted = HashSet::new();
+    let mut stderr_tail = VecDeque::with_capacity(80);
+    let started = Instant::now();
+    let mut last_activity = Instant::now();
+    let mut last_emit = Instant::now() - Duration::from_secs(2);
+    let mut last_percent = usize::MAX;
+
+    loop {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(TarLine::Stdout(line)) | Ok(TarLine::Stderr(line)) => {
+                last_activity = Instant::now();
+                let normalized = line.strip_prefix("x ").unwrap_or(&line).trim();
+                if archive_entries.contains(normalized) {
+                    extracted.insert(normalized.to_string());
+                } else if !line.trim().is_empty() {
+                    if stderr_tail.len() == 80 { stderr_tail.pop_front(); }
+                    stderr_tail.push_back(line);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+
+        let count = extracted.len().min(total);
+        let phase_progress = count as f64 / total as f64;
+        let percent = (phase_progress * 100.0).floor() as usize;
+        if json && (percent != last_percent || last_emit.elapsed() >= Duration::from_secs(1)) {
+            emit_runtime_progress(
+                true,
+                "Extracting",
+                &format!("Extracting DarwinWine · {count}/{total} files"),
+                Some(phase_progress),
+                Some(0.18 + phase_progress * 0.22),
+            )?;
+            last_percent = percent;
+            last_emit = Instant::now();
+        }
+
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                let detail = stderr_tail.into_iter().collect::<Vec<_>>().join("\n");
+                let status_detail = status.code()
+                    .map(|code| format!("exit code {code}"))
+                    .unwrap_or_else(|| "terminated by signal".into());
+                return Err(AppError::Runtime(format!(
+                    "DarwinWine extraction failed ({status_detail}): {}",
+                    detail.trim()
+                )));
+            }
+            if json {
+                emit_runtime_progress(true, "Extracting", "DarwinWine extracted", Some(1.0), Some(0.40))?;
+            }
+            return Ok(());
+        }
+
+        if started.elapsed() >= EXTRACTION_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::Runtime(format!(
+                "DarwinWine extraction timed out after {} minutes",
+                EXTRACTION_TIMEOUT.as_secs() / 60
+            )));
+        }
+        if last_activity.elapsed() >= EXTRACTION_STALL_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::Runtime(format!(
+                "DarwinWine extraction produced no progress for {} minutes",
+                EXTRACTION_STALL_TIMEOUT.as_secs() / 60
+            )));
+        }
+    }
+}
+
+fn probe_runtime(runtime: &WineRuntime, prefix: &Path) -> Result<()> {
+    // First-run validation must mirror DarwinWine itself: pass Wine a path that does
+    // not exist yet and let wineboot create the prefix. Pre-creating an empty prefix
+    // changes Wine's initialization path and can result in a successful exit without
+    // the registry files being materialized.
+    remove_path_if_exists(prefix)?;
+    let parent = prefix
+        .parent()
+        .ok_or_else(|| AppError::Runtime("DarwinWine probe prefix has no parent directory".into()))?;
+    fs::create_dir_all(parent)?;
+    let log_path = parent.join("darwinwine-install-probe.log");
+    let _ = fs::remove_file(&log_path);
+
+    let wineboot_status = run_probe_command(
+        &runtime.wine,
+        &["wineboot", "-u"],
+        prefix,
+        &runtime.wine,
+        &log_path,
+        INSTALL_PROBE_TIMEOUT,
+        true,
+        None,
+    )?;
+
+    if !wineboot_status.success() {
+        return Err(probe_failure(
+            "DarwinWine wineboot probe failed",
+            &log_path,
+            Some(&wineboot_status),
+        ));
+    }
+
+    // wineboot can return after handing asynchronous prefix work to wineserver. Wait
+    // until the server drains before inspecting system.reg, exactly like DarwinWine's
+    // own runtime validator.
+    let wineserver_status = run_probe_command(
+        &runtime.wineserver,
+        &["-w"],
+        prefix,
+        &runtime.wine,
+        &log_path,
+        Duration::from_secs(30),
+        false,
+        None,
+    )?;
+    if !wineserver_status.success() {
+        return Err(probe_failure(
+            "DarwinWine wineserver -w probe failed",
+            &log_path,
+            Some(&wineserver_status),
+        ));
+    }
+
+    for _ in 0..50 {
+        if prefix.join("system.reg").is_file() {
+            let _ = fs::remove_file(&log_path);
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // A quiet probe can legitimately produce no output. Run one bounded diagnostic
+    // pass before reporting failure so the UI gets actionable Wine loader/process
+    // information rather than only "system.reg missing".
+    if fs::metadata(&log_path).map(|metadata| metadata.len() == 0).unwrap_or(true) {
+        let _ = run_probe_command(
+            &runtime.wine,
+            &["wineboot", "-u"],
+            prefix,
+            &runtime.wine,
+            &log_path,
+            Duration::from_secs(30),
+            true,
+            Some("+process,+module,+loaddll,+seh"),
+        );
+        let _ = run_probe_command(
+            &runtime.wineserver,
+            &["-w"],
+            prefix,
+            &runtime.wine,
+            &log_path,
+            Duration::from_secs(10),
+            false,
+            None,
+        );
+    }
+
+    Err(probe_failure(
+        "DarwinWine wineboot probe completed but did not create system.reg",
+        &log_path,
+        None,
+    ))
+}
+
+fn run_probe_command(
+    executable: &Path,
+    arguments: &[&str],
+    prefix: &Path,
+    wine: &Path,
+    log_path: &Path,
+    timeout: Duration,
+    prefix_bootstrap: bool,
+    wine_debug_override: Option<&str>,
+) -> Result<std::process::ExitStatus> {
+    let mut command = Command::new(executable);
+    command.args(arguments);
+    if prefix_bootstrap {
+        configure_command(&mut command, prefix, &LaunchGraphics::wined3d(), wine);
+        configure_prefix_bootstrap(&mut command);
+    } else {
+        command.env("WINEPREFIX", prefix);
+        configure_runtime_library_environment(&mut command, wine);
+    }
+    if let Some(debug) = wine_debug_override {
+        command.env("WINEDEBUG", debug);
+    }
+
+    let log = OpenOptions::new().create(true).append(true).open(log_path)?;
+    let stderr = log.try_clone()?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
+        .spawn()?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::Runtime(format!(
+                "DarwinWine probe command timed out after {} seconds: {}",
+                timeout.as_secs(),
+                probe_log_tail(log_path)
+            )));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn probe_failure(prefix: &str, log_path: &Path, status: Option<&std::process::ExitStatus>) -> AppError {
+    let status = status
+        .map(process_status_description)
+        .map(|value| format!(" ({value})"))
+        .unwrap_or_default();
+    let detail = probe_log_tail(log_path);
+    if detail.is_empty() {
+        AppError::Runtime(format!("{prefix}{status}"))
+    } else {
+        AppError::Runtime(format!("{prefix}{status}: {detail}"))
+    }
+}
+
+fn probe_log_tail(log_path: &Path) -> String {
+    let content = fs::read_to_string(log_path).unwrap_or_default();
+    let mut lines = content.lines().rev().take(40).collect::<Vec<_>>();
+    lines.reverse();
+    lines.join("\n")
+}
+
+fn emit_runtime_progress(json: bool, phase: &str, message: &str, progress: Option<f64>, overall: Option<f64>) -> Result<()> {
+    if json {
+        write_progress("wine_runtime_progress", phase, message, progress, overall, None, None)
+    } else {
+        println!("[{phase}] {message}");
+        Ok(())
+    }
+}
+
+fn remove_legacy_managed_wine_state(support: &Path) -> Result<()> {
+    // v0.8 and earlier stored app-managed Wine providers under `engines` and
+    // cached their source packages under `downloads/wine`. DarwinPlay 0.9
+    // supports DarwinWine only, so those private app-owned paths are removed
+    // after a new DarwinWine runtime has been validated and activated.
+    remove_path_if_exists(&support.join("engines"))?;
+    remove_path_if_exists(&support.join("downloads").join("wine"))?;
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    if !path.exists() { return Ok(()); }
+    if path.is_dir() { fs::remove_dir_all(path)?; } else { fs::remove_file(path)?; }
+    Ok(())
+}
 impl WineRuntime {
-    pub fn discover(explicit: Option<&Path>) -> Result<Self> {
-        let wine = discover_wine(explicit)?;
-        let wineserver = discover_wineserver(&wine)?;
+    pub fn discover() -> Result<Self> {
+        let root = darwinwine_root()?;
+        if !root.is_dir() {
+            return Err(AppError::RuntimeNotFound);
+        }
+        let manifest = load_manifest(&root).map_err(|_| AppError::RuntimeNotFound)?;
+        validate_manifest(&manifest)?;
+        Self::from_root(&root, &manifest)
+    }
+
+    fn from_root(root: &Path, manifest: &DarwinWineManifest) -> Result<Self> {
+        let wine = root.join(&manifest.entrypoint);
+        let wineserver = root.join(&manifest.wineserver);
+        if !wine.is_file() || !wineserver.is_file() {
+            return Err(AppError::Runtime("DarwinWine entrypoints are missing".into()));
+        }
         let version = command_output(Command::new(&wine).arg("--version"))?;
-        Ok(Self {
-            wine,
-            wineserver,
-            version,
-        })
+        Ok(Self { wine, wineserver, version })
     }
 
     pub fn version(&self) -> &str {
@@ -137,15 +662,61 @@ impl WineRuntime {
     }
 
     pub fn initialize_prefix(&self, prefix: &Path) -> Result<()> {
-        let mut command = Command::new(&self.wine);
-        command.arg("wineboot.exe").arg("-u");
-        configure_command(&mut command, prefix, &LaunchGraphics::wined3d());
-        let output = command.stdin(Stdio::null()).output()?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(command_failure("wineboot", &output))
+        let parent = prefix
+            .parent()
+            .ok_or_else(|| AppError::Runtime("Wine prefix has no parent directory".into()))?;
+        fs::create_dir_all(parent)?;
+        let file_name = prefix
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("prefix");
+        let log_path = parent.join(format!(".{file_name}.wineboot.log"));
+        let _ = fs::remove_file(&log_path);
+
+        let wineboot_status = run_probe_command(
+            &self.wine,
+            &["wineboot", "-u"],
+            prefix,
+            &self.wine,
+            &log_path,
+            INSTALL_PROBE_TIMEOUT,
+            true,
+            None,
+        )?;
+        if !wineboot_status.success() {
+            return Err(probe_failure("wineboot failed", &log_path, Some(&wineboot_status)));
         }
+
+        let wineserver_status = run_probe_command(
+            &self.wineserver,
+            &["-w"],
+            prefix,
+            &self.wine,
+            &log_path,
+            Duration::from_secs(30),
+            false,
+            None,
+        )?;
+        if !wineserver_status.success() {
+            return Err(probe_failure(
+                "wineserver -w failed",
+                &log_path,
+                Some(&wineserver_status),
+            ));
+        }
+
+        for _ in 0..50 {
+            if prefix.join("system.reg").is_file() {
+                let _ = fs::remove_file(&log_path);
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err(probe_failure(
+            "wineboot completed but did not create system.reg",
+            &log_path,
+            None,
+        ))
     }
 
     pub fn launch(
@@ -168,7 +739,7 @@ impl WineRuntime {
         let windows_path = format!("G:\\{file_name}");
         let mut command = Command::new(&self.wine);
         command.arg(windows_path).current_dir(parent);
-        configure_command(&mut command, prefix, graphics);
+        configure_command(&mut command, prefix, graphics, &self.wine);
         self.stream_command(command, prefix, json, graphics.backend)
             .map(|_| ())
     }
@@ -184,7 +755,7 @@ impl WineRuntime {
         validate_windows_executable(executable)?;
         let mut command = Command::new(&self.wine);
         command.arg(executable).args(arguments);
-        configure_command(&mut command, prefix, graphics);
+        configure_command(&mut command, prefix, graphics, &self.wine);
         self.stream_command(command, prefix, json, graphics.backend)
     }
 
@@ -197,7 +768,7 @@ impl WineRuntime {
         validate_windows_executable(executable)?;
         let mut command = Command::new(&self.wine);
         command.arg(executable).args(arguments);
-        configure_command(&mut command, prefix, &LaunchGraphics::wined3d());
+        configure_command(&mut command, prefix, &LaunchGraphics::wined3d(), &self.wine);
         let output = command.stdin(Stdio::null()).output()?;
         if output.status.success() {
             Ok(output.status.code().unwrap_or(0))
@@ -217,7 +788,7 @@ impl WineRuntime {
         validate_windows_executable(executable)?;
         let mut command = Command::new(&self.wine);
         command.arg(executable).args(arguments);
-        configure_command(&mut command, prefix, graphics);
+        configure_command(&mut command, prefix, graphics, &self.wine);
         let log_path = prefix.join(".darwinplay-wine-command.log");
         let log = File::create(&log_path)?;
         let stderr = log.try_clone()?;
@@ -272,7 +843,7 @@ impl WineRuntime {
         }
         let mut command = Command::new(&self.wine);
         command.args(["tasklist.exe", "/fo", "csv", "/nh"]);
-        configure_command(&mut command, prefix, &LaunchGraphics::wined3d());
+        configure_command(&mut command, prefix, &LaunchGraphics::wined3d(), &self.wine);
         let output = command.stdin(Stdio::null()).output()?;
         if !output.status.success() {
             return Err(command_failure("tasklist", &output));
@@ -287,17 +858,19 @@ impl WineRuntime {
         if !prefix.exists() {
             return Ok(());
         }
-        let output = Command::new(&self.wineserver)
-            .arg("-k")
-            .env("WINEPREFIX", prefix)
+        let mut kill = Command::new(&self.wineserver);
+        kill.arg("-k").env("WINEPREFIX", prefix);
+        configure_runtime_library_environment(&mut kill, &self.wine);
+        let output = kill
             .stdin(Stdio::null())
             .output()?;
         if !output.status.success() {
             return Err(command_failure("wineserver -k", &output));
         }
-        let wait = Command::new(&self.wineserver)
-            .arg("-w")
-            .env("WINEPREFIX", prefix)
+        let mut wait_command = Command::new(&self.wineserver);
+        wait_command.arg("-w").env("WINEPREFIX", prefix);
+        configure_runtime_library_environment(&mut wait_command, &self.wine);
+        let wait = wait_command
             .stdin(Stdio::null())
             .output()?;
         if wait.status.success() {
@@ -402,10 +975,25 @@ impl WineRuntime {
 
 fn tasklist_contains_image(output: &str, image_name: &str) -> bool {
     output.lines().any(|line| {
-        line.split(|character: char| character == ',' || character.is_whitespace())
-            .map(|value| value.trim_matches('"'))
-            .any(|value| value.eq_ignore_ascii_case(image_name))
+        tasklist_image_name(line)
+            .is_some_and(|value| value.eq_ignore_ascii_case(image_name))
     })
+}
+
+fn tasklist_image_name(line: &str) -> Option<&str> {
+    let line = line.trim().trim_start_matches('\u{feff}');
+    if line.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = line.strip_prefix('"') {
+        return rest.find('"').map(|end| &rest[..end]);
+    }
+
+    line.split(',')
+        .next()
+        .map(|value| value.trim().trim_matches('"'))
+        .filter(|value| !value.is_empty())
 }
 
 fn validate_windows_executable(value: &str) -> Result<()> {
@@ -425,16 +1013,46 @@ fn validate_windows_executable(value: &str) -> Result<()> {
     }
 }
 
-fn configure_command(command: &mut Command, prefix: &Path, graphics: &LaunchGraphics) {
+fn configure_command(
+    command: &mut Command,
+    prefix: &Path,
+    graphics: &LaunchGraphics,
+    wine: &Path,
+) {
     command
         .env("WINEPREFIX", prefix)
         .env("WINEDEBUG", wine_debug())
         .env_remove("WINEDLLPATH")
+        .env_remove("WINEDLLPATH_PREPEND")
         .env_remove("WINEDLLOVERRIDES")
         .env_remove("DXMT_LOG_LEVEL")
         .env_remove("DXMT_LOG_PATH")
         .env_remove("DXMT_SHADER_CACHE_PATH")
         .envs(&graphics.environment);
+    configure_runtime_library_environment(command, wine);
+}
+
+fn configure_prefix_bootstrap(command: &mut Command) {
+    command
+        .env("WINEARCH", "win64")
+        .env("WINEDLLOVERRIDES", "winebus.sys=d");
+}
+
+fn configure_runtime_library_environment(command: &mut Command, wine: &Path) {
+    let Some(lib) = managed_runtime_library_directory(wine) else {
+        return;
+    };
+    if !lib.is_dir() {
+        return;
+    }
+
+    let mut paths = vec![lib];
+    if let Some(existing) = env::var_os("DYLD_FALLBACK_LIBRARY_PATH") {
+        paths.extend(env::split_paths(&existing));
+    }
+    if let Ok(joined) = env::join_paths(paths) {
+        command.env("DYLD_FALLBACK_LIBRARY_PATH", joined);
+    }
 }
 
 fn write_log(json: bool, stream: &str, message: &str) -> Result<()> {
@@ -489,187 +1107,15 @@ fn backend_name(backend: GraphicsBackend) -> &'static str {
     }
 }
 
-fn discover_wine(explicit: Option<&Path>) -> Result<PathBuf> {
-    if let Some(path) = explicit {
-        return if path.is_file() {
-            Ok(path.to_path_buf())
-        } else {
-            Err(AppError::InvalidFile(path.display().to_string()))
-        };
-    }
-
-    if let Some(path) = env::var_os("DARWINPLAY_WINE") {
-        let path = PathBuf::from(path);
-        return if path.is_file() {
-            Ok(path)
-        } else {
-            Err(AppError::InvalidFile(path.display().to_string()))
-        };
-    }
-
-    let mut candidates = Vec::new();
-    if let Some(path) = find_in_path("wine") {
-        candidates.push(path);
-    }
-    candidates.extend([
-        PathBuf::from("/opt/homebrew/bin/wine"),
-        PathBuf::from("/usr/local/bin/wine"),
-        PathBuf::from("/Applications/Wine Stable.app/Contents/Resources/wine/bin/wine"),
-        PathBuf::from("/Applications/Wine Devel.app/Contents/Resources/wine/bin/wine"),
-    ]);
-
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .ok_or(AppError::WineNotFound)
+fn managed_runtime_library_directory(wine: &Path) -> Option<PathBuf> {
+    wine.parent()?.parent().map(|root| root.join("lib"))
 }
 
-fn discover_wineserver(wine: &Path) -> Result<PathBuf> {
-    if let Some(parent) = wine.parent() {
-        let sibling = parent.join("wineserver");
-        if sibling.is_file() {
-            return Ok(sibling);
-        }
-    }
-    find_in_path("wineserver").ok_or(AppError::WineServerNotFound)
-}
-
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
-}
 
 fn command_output(command: &mut Command) -> Result<String> {
-    let output = command.output()?;
-    if !output.status.success() {
-        return Err(command_failure("command", &output));
-    }
+    let output = command.stdin(Stdio::null()).output()?;
+    if !output.status.success() { return Err(command_failure("command", &output)); }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn discover_homebrew() -> Option<PathBuf> {
-    [
-        PathBuf::from("/opt/homebrew/bin/brew"),
-        PathBuf::from("/usr/local/bin/brew"),
-    ]
-    .into_iter()
-    .chain(find_in_path("brew"))
-    .find(|candidate| candidate.is_file())
-}
-
-fn is_homebrew_managed_wine(wine: &Path) -> bool {
-    wine.starts_with("/Applications/Wine Stable.app")
-        || wine == Path::new("/opt/homebrew/bin/wine")
-        || wine == Path::new("/usr/local/bin/wine")
-}
-
-fn homebrew_has_wine(brew: &Path) -> bool {
-    let mut command = Command::new(brew);
-    command.args(["list", "--cask", HOMEBREW_WINE_CASK]);
-    configure_homebrew_command(&mut command);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-fn configure_homebrew_command(command: &mut Command) {
-    let current = env::var("PATH").unwrap_or_default();
-    let base = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-    let path = if current.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}:{current}")
-    };
-    command.env("PATH", path).env("HOMEBREW_NO_AUTO_UPDATE", "1");
-}
-
-fn stream_managed_command(mut command: Command, json: bool) -> Result<()> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    if json {
-        write_json(&RuntimeEvent {
-            kind: "started",
-            stream: None,
-            message: None,
-            backend: None,
-            pid: Some(child.id()),
-            exit_code: None,
-            prefix: None,
-        })?;
-    }
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::ProcessFailed("Homebrew stdout was not captured".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AppError::ProcessFailed("Homebrew stderr was not captured".into()))?;
-    let (sender, receiver) = mpsc::channel::<(String, String)>();
-
-    let stdout_sender = sender.clone();
-    let stdout_thread = thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(|line| line.ok()) {
-            if stdout_sender.send(("stdout".into(), line)).is_err() {
-                break;
-            }
-        }
-    });
-
-    let stderr_sender = sender.clone();
-    let stderr_thread = thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(|line| line.ok()) {
-            if stderr_sender.send(("stderr".into(), line)).is_err() {
-                break;
-            }
-        }
-    });
-    drop(sender);
-
-    let status = loop {
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok((stream, message)) => write_log(json, &stream, &message)?,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break child.wait()?,
-        }
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-    };
-
-    let _ = stdout_thread.join();
-    let _ = stderr_thread.join();
-    for (stream, message) in receiver.try_iter() {
-        write_log(json, &stream, &message)?;
-    }
-    let exit_code = status.code().unwrap_or(-1);
-    if json {
-        write_json(&RuntimeEvent {
-            kind: "exited",
-            stream: None,
-            message: None,
-            backend: None,
-            pid: None,
-            exit_code: Some(exit_code),
-            prefix: None,
-        })?;
-    }
-    if status.success() {
-        Ok(())
-    } else {
-        Err(AppError::ProcessFailed(format!(
-            "Homebrew exited with {exit_code}"
-        )))
-    }
 }
 
 fn wine_debug() -> OsString {
@@ -677,18 +1123,128 @@ fn wine_debug() -> OsString {
 }
 
 #[cfg(test)]
-mod process_tests {
-    use super::tasklist_contains_image;
+mod tests {
+    use super::{tasklist_contains_image, validate_manifest, validate_relative_runtime_path, validate_supported_darwinwine_version, DarwinWineManifest};
 
     #[test]
     fn detects_steam_in_csv_tasklist() {
-        let output = "\"steam.exe\",\"00000020\",\"Console\",\"1\",\"120,000 K\"\n\"steamwebhelper.exe\",\"00000024\",\"Console\",\"1\",\"80,000 K\"";
+        let output = "\"steam.exe\",\"00000020\",\"Console\",\"1\",\"120,000 K\"\r\n";
         assert!(tasklist_contains_image(output, "steam.exe"));
     }
 
     #[test]
-    fn does_not_confuse_steamwebhelper_with_steam() {
-        let output = "steamwebhelper.exe 00000024 Console 1";
+    fn tasklist_matches_only_image_name_column() {
+        let output = "\"notepad.exe\",\"00000020\",\"steam.exe\",\"1\",\"120,000 K\"";
         assert!(!tasklist_contains_image(output, "steam.exe"));
     }
+
+    #[test]
+    fn tasklist_accepts_bom_and_case_insensitive_image_name() {
+        let output = "\u{feff}\"STEAM.EXE\",\"00000020\",\"Console\",\"1\",\"120,000 K\"";
+        assert!(tasklist_contains_image(output, "steam.exe"));
+    }
+
+    #[test]
+    fn rejects_parent_runtime_path() {
+        assert!(validate_relative_runtime_path("../bin/wine").is_err());
+    }
+
+    #[test]
+    fn rejects_pre_dp5_crossover_darwinwine() {
+        assert!(validate_supported_darwinwine_version("cx26.3-dp4").is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_winehq_darwinwine_version_family() {
+        assert!(validate_supported_darwinwine_version("10.20-dp8").is_err());
+    }
+
+    #[test]
+    fn accepts_cx26_3_dp5_and_newer_darwinwine() {
+        assert!(validate_supported_darwinwine_version("cx26.3-dp5").is_ok());
+        assert!(validate_supported_darwinwine_version("cx26.3-dp6").is_ok());
+        assert!(validate_supported_darwinwine_version("cx26.4-dp1").is_ok());
+        assert!(validate_supported_darwinwine_version("cx27.0-dp1").is_ok());
+    }
+    #[test]
+    fn decodes_canonical_minimum_macos_manifest_field() {
+        let manifest: DarwinWineManifest = serde_json::from_str(r#"{
+            "schemaVersion":2,
+            "id":"darwinwine-cx26.3-dp5",
+            "name":"DarwinWine",
+            "wineVersion":"10.0",
+            "darwinWineVersion":"cx26.3-dp5",
+            "architecture":"x86_64",
+            "minimumMacOS":"13.0",
+            "channel":"experimental",
+            "entrypoint":"bin/wine",
+            "wineserver":"bin/wineserver",
+            "steamValidated":true,
+            "steamLoginValidated":false
+        }"#).unwrap();
+        assert_eq!(manifest.minimum_mac_os, "13.0");
+    }
+
+    #[test]
+    fn accepts_legacy_minimum_macos_alias() {
+        let manifest: DarwinWineManifest = serde_json::from_str(r#"{
+            "schemaVersion":2,
+            "id":"darwinwine-cx26.3-dp5",
+            "name":"DarwinWine",
+            "wineVersion":"10.0",
+            "darwinWineVersion":"cx26.3-dp5",
+            "architecture":"x86_64",
+            "minimumMacOs":"13.0",
+            "channel":"experimental",
+            "entrypoint":"bin/wine",
+            "wineserver":"bin/wineserver",
+            "steamValidated":true,
+            "steamLoginValidated":false
+        }"#).unwrap();
+        assert_eq!(manifest.minimum_mac_os, "13.0");
+    }
+
+    #[test]
+    fn accepts_schema2_crossover_manifest() {
+        let manifest: DarwinWineManifest = serde_json::from_str(r#"{
+            "schemaVersion":2,
+            "id":"darwinwine-cx26.3-dp5",
+            "name":"DarwinWine",
+            "wineVersion":"10.0",
+            "darwinWineVersion":"cx26.3-dp5",
+            "architecture":"x86_64",
+            "minimumMacOS":"13.0",
+            "channel":"experimental",
+            "entrypoint":"bin/wine",
+            "wineserver":"bin/wineserver",
+            "steamValidated":true,
+            "steamLoginValidated":false,
+            "wow64":true,
+            "inputBackend":"native-no-sdl",
+            "upstream":"CodeWeavers CrossOver FOSS",
+            "upstreamVersion":"26.3.0",
+            "moltenVKVersion":"1.4.2"
+        }"#).unwrap();
+        assert!(validate_manifest(&manifest).is_ok());
+    }
+
+    #[test]
+    fn rejects_schema1_manifest() {
+        let manifest: DarwinWineManifest = serde_json::from_str(r#"{
+            "schemaVersion":1,
+            "id":"darwinwine-cx26.3-dp5",
+            "name":"DarwinWine",
+            "wineVersion":"10.0",
+            "darwinWineVersion":"cx26.3-dp5",
+            "architecture":"x86_64",
+            "minimumMacOS":"13.0",
+            "channel":"experimental",
+            "entrypoint":"bin/wine",
+            "wineserver":"bin/wineserver",
+            "steamValidated":true,
+            "steamLoginValidated":false
+        }"#).unwrap();
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
 }

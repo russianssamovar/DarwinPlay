@@ -30,15 +30,19 @@ public struct SteamLibrary: Codable, Equatable, Sendable {
   public let games: [SteamGame]
 }
 
-public struct WineStatus: Codable, Equatable, Sendable {
+public struct DarwinWineStatus: Codable, Equatable, Sendable {
   public let installed: Bool
   public let ready: Bool
+  public let runtimeId: String?
+  public let runtimeName: String?
   public let winePath: String?
   public let wineVersion: String?
+  public let darwinWineVersion: String?
+  public let architecture: String?
+  public let channel: String?
+  public let steamValidated: Bool
+  public let steamLoginValidated: Bool
   public let probeError: String?
-  public let homebrewInstalled: Bool
-  public let homebrewPath: String?
-  public let managedByHomebrew: Bool
 }
 
 public struct SteamStatus: Codable, Equatable, Sendable {
@@ -48,6 +52,11 @@ public struct SteamStatus: Codable, Equatable, Sendable {
   public let steamPath: String?
   public let gamesInstalled: Int
   public let uiPolicyCurrent: Bool
+  public let uiBackend: GraphicsBackendPreference?
+  public let uiDxmtVersion: String?
+  public let uiBackendVerified: Bool
+  public let prefixRuntimeCompatible: Bool
+  public let prefixRuntimeVersion: String?
 
   public init(
     installed: Bool,
@@ -55,7 +64,12 @@ public struct SteamStatus: Codable, Equatable, Sendable {
     prefix: String,
     steamPath: String?,
     gamesInstalled: Int,
-    uiPolicyCurrent: Bool = true
+    uiPolicyCurrent: Bool = true,
+    uiBackend: GraphicsBackendPreference? = nil,
+    uiDxmtVersion: String? = nil,
+    uiBackendVerified: Bool = true,
+    prefixRuntimeCompatible: Bool = true,
+    prefixRuntimeVersion: String? = nil
   ) {
     self.installed = installed
     self.running = running
@@ -63,6 +77,11 @@ public struct SteamStatus: Codable, Equatable, Sendable {
     self.steamPath = steamPath
     self.gamesInstalled = gamesInstalled
     self.uiPolicyCurrent = uiPolicyCurrent
+    self.uiBackend = uiBackend
+    self.uiDxmtVersion = uiDxmtVersion
+    self.uiBackendVerified = uiBackendVerified
+    self.prefixRuntimeCompatible = prefixRuntimeCompatible
+    self.prefixRuntimeVersion = prefixRuntimeVersion
   }
 
   public init(from decoder: Decoder) throws {
@@ -73,6 +92,12 @@ public struct SteamStatus: Codable, Equatable, Sendable {
     steamPath = try container.decodeIfPresent(String.self, forKey: .steamPath)
     gamesInstalled = try container.decode(Int.self, forKey: .gamesInstalled)
     uiPolicyCurrent = try container.decodeIfPresent(Bool.self, forKey: .uiPolicyCurrent) ?? true
+    uiBackend = try container.decodeIfPresent(GraphicsBackendPreference.self, forKey: .uiBackend)
+    uiDxmtVersion = try container.decodeIfPresent(String.self, forKey: .uiDxmtVersion)
+    uiBackendVerified = try container.decodeIfPresent(Bool.self, forKey: .uiBackendVerified) ?? true
+    prefixRuntimeCompatible =
+      try container.decodeIfPresent(Bool.self, forKey: .prefixRuntimeCompatible) ?? true
+    prefixRuntimeVersion = try container.decodeIfPresent(String.self, forKey: .prefixRuntimeVersion)
   }
 }
 
@@ -207,19 +232,24 @@ public enum DxmtMode: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 public struct AppSettings: Codable, Equatable, Sendable {
-  public var winePath: String
   public var graphicsBackend: GraphicsBackendPreference
+  public var steamUiBackend: GraphicsBackendPreference
 
-  public init(winePath: String = "", graphicsBackend: GraphicsBackendPreference = .auto) {
-    self.winePath = winePath
+  public init(
+    graphicsBackend: GraphicsBackendPreference = .auto,
+    steamUiBackend: GraphicsBackendPreference = .auto
+  ) {
     self.graphicsBackend = graphicsBackend
+    self.steamUiBackend = steamUiBackend
   }
 
   public init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
-    winePath = try container.decodeIfPresent(String.self, forKey: .winePath) ?? ""
     graphicsBackend =
       try container.decodeIfPresent(GraphicsBackendPreference.self, forKey: .graphicsBackend)
+      ?? .auto
+    steamUiBackend =
+      try container.decodeIfPresent(GraphicsBackendPreference.self, forKey: .steamUiBackend)
       ?? .auto
   }
 }
@@ -247,6 +277,19 @@ public struct DxmtStatus: Codable, Equatable, Sendable {
   public let mode: DxmtMode?
   public let sourceName: String?
   public let hasD3d10core: Bool
+  public let version: String?
+  public let managed: Bool
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    installed = try container.decode(Bool.self, forKey: .installed)
+    root = try container.decodeIfPresent(String.self, forKey: .root)
+    mode = try container.decodeIfPresent(DxmtMode.self, forKey: .mode)
+    sourceName = try container.decodeIfPresent(String.self, forKey: .sourceName)
+    hasD3d10core = try container.decodeIfPresent(Bool.self, forKey: .hasD3d10core) ?? false
+    version = try container.decodeIfPresent(String.self, forKey: .version)
+    managed = try container.decodeIfPresent(Bool.self, forKey: .managed) ?? false
+  }
 }
 
 public struct RuntimeEvent: Codable, Equatable, Sendable {
@@ -257,4 +300,9 @@ public struct RuntimeEvent: Codable, Equatable, Sendable {
   public let pid: UInt32?
   public let exitCode: Int32?
   public let prefix: String?
+  public let phase: String?
+  public let progress: Double?
+  public let overallProgress: Double?
+  public let currentBytes: UInt64?
+  public let totalBytes: UInt64?
 }

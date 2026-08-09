@@ -192,9 +192,11 @@ struct ImportedGameCard: View {
 
         HStack(spacing: 6) {
           Circle()
-            .fill(model.wineStatus?.ready == true ? DarwinPalette.success : DarwinPalette.warning)
+            .fill(
+              model.runtimeStatus?.ready == true ? DarwinPalette.success : DarwinPalette.warning
+            )
             .frame(width: 5, height: 5)
-          Text(model.wineStatus?.ready == true ? "Ready" : "Needs Wine")
+          Text(model.runtimeStatus?.ready == true ? "Ready" : "Needs Runtime")
             .font(.system(size: 10.5, weight: .medium))
             .foregroundStyle(DarwinPalette.textSecondary)
           Spacer()

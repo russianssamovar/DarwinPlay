@@ -25,6 +25,7 @@ impl PrefixManager {
         let marker = path.join(".darwinplay-initialized");
         if marker.is_file() {
             if prefix_payload_ready(&path) {
+                self.verify_runtime(runtime, game_id)?;
                 return Ok(path);
             }
             return Err(AppError::CorruptPrefix(path.display().to_string()));
@@ -40,7 +41,9 @@ impl PrefixManager {
         if staging.exists() {
             fs::remove_dir_all(&staging)?;
         }
-        fs::create_dir_all(&staging)?;
+        // Leave the staging prefix path absent. Wine's first-run initialization expects
+        // to create the prefix itself; pre-creating an empty directory can short-circuit
+        // wineboot before registry files are materialized.
 
         let result = (|| {
             runtime.initialize_prefix(&staging)?;
@@ -62,6 +65,36 @@ impl PrefixManager {
 
         fs::rename(&staging, &path)?;
         Ok(path)
+    }
+
+    pub fn recorded_runtime_version(&self, game_id: &str) -> Result<Option<String>> {
+        let marker = self.path(game_id)?.join(".darwinplay-initialized");
+        match fs::read_to_string(marker) {
+            Ok(value) => Ok(Some(value.trim().to_string())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn runtime_compatible(&self, runtime: &WineRuntime, game_id: &str) -> Result<bool> {
+        let Some(recorded) = self.recorded_runtime_version(game_id)? else {
+            return Ok(true);
+        };
+        Ok(wine_major(&recorded) == wine_major(runtime.version()))
+    }
+
+    pub fn verify_runtime(&self, runtime: &WineRuntime, game_id: &str) -> Result<()> {
+        let Some(recorded) = self.recorded_runtime_version(game_id)? else {
+            return Ok(());
+        };
+        if wine_major(&recorded) == wine_major(runtime.version()) {
+            Ok(())
+        } else {
+            Err(AppError::PrefixRuntimeMismatch(
+                recorded,
+                runtime.version().to_string(),
+            ))
+        }
     }
 
     pub fn bind_game_drive(&self, prefix: &Path, executable: &Path) -> Result<()> {
@@ -92,6 +125,15 @@ impl PrefixManager {
         }
         Ok(())
     }
+}
+
+fn wine_major(version: &str) -> Option<u32> {
+    version
+        .trim()
+        .trim_start_matches("wine-")
+        .split('.')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
 }
 
 fn prefix_payload_ready(path: &Path) -> bool {

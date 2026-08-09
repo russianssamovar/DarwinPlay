@@ -2,10 +2,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "darwinplay-runtime", version, about = "Wine runtime controller for DarwinPlay")]
+#[command(name = "darwinplay-runtime", version, about = "DarwinWine runtime controller for DarwinPlay")]
 pub struct Cli {
-    #[arg(long, global = true)]
-    pub wine: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -16,9 +14,9 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    Wine {
+    Runtime {
         #[command(subcommand)]
-        command: WineCommand,
+        command: RuntimeCommand,
     },
     Inspect {
         executable: PathBuf,
@@ -54,16 +52,14 @@ pub enum Command {
 }
 
 #[derive(Subcommand)]
-pub enum WineCommand {
+pub enum RuntimeCommand {
     Status {
         #[arg(long)]
         json: bool,
     },
     Install {
         #[arg(long)]
-        json: bool,
-    },
-    Reinstall {
+        archive: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -107,6 +103,14 @@ pub enum DxmtCommand {
         #[arg(long)]
         json: bool,
     },
+    InstallLatest {
+        #[arg(long)]
+        json: bool,
+    },
+    Update {
+        #[arg(long)]
+        json: bool,
+    },
     Remove,
 }
 
@@ -131,13 +135,13 @@ pub enum SteamCommand {
         json: bool,
     },
     Start {
-        #[arg(long, value_enum, default_value_t = GraphicsBackendArg::Wined3d)]
+        #[arg(long, value_enum, default_value_t = GraphicsBackendArg::Auto)]
         backend: GraphicsBackendArg,
         #[arg(long)]
         json: bool,
     },
     Restart {
-        #[arg(long, value_enum, default_value_t = GraphicsBackendArg::Wined3d)]
+        #[arg(long, value_enum, default_value_t = GraphicsBackendArg::Auto)]
         backend: GraphicsBackendArg,
         #[arg(long)]
         json: bool,

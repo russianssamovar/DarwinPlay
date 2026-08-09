@@ -75,12 +75,7 @@ struct ContentView: View {
   }
 
   private func friendlyError(_ message: String) -> String {
-    let lower = message.lowercased()
-    if lower.contains("homebrew was not found") {
-      return
-        "Homebrew is required for managed Wine installation. Install Homebrew first or configure a Wine executable manually in Settings."
-    }
-    return message
+    message
   }
 }
 

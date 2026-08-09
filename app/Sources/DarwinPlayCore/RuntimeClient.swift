@@ -45,24 +45,20 @@ public struct RuntimeClient: Sendable {
     throw RuntimeClientError.runtimeNotFound
   }
 
-  public func wineStatus(winePath: String?) async throws -> WineStatus {
-    try await runJSON(arguments: globalArguments(winePath) + ["wine", "status", "--json"])
+  public func runtimeStatus() async throws -> DarwinWineStatus {
+    try await runJSON(arguments: ["runtime", "status", "--json"])
   }
 
-  public func installWine() -> AsyncThrowingStream<RuntimeEvent, Error> {
-    stream(arguments: ["wine", "install", "--json"])
+  public func installDarwinWine(archive: URL) -> AsyncThrowingStream<RuntimeEvent, Error> {
+    stream(arguments: ["runtime", "install", "--archive", archive.path, "--json"])
   }
 
-  public func reinstallWine() -> AsyncThrowingStream<RuntimeEvent, Error> {
-    stream(arguments: ["wine", "reinstall", "--json"])
+  public func removeDarwinWine() async throws {
+    _ = try await run(arguments: ["runtime", "remove", "--json"])
   }
 
-  public func removeWine() -> AsyncThrowingStream<RuntimeEvent, Error> {
-    stream(arguments: ["wine", "remove", "--json"])
-  }
-
-  public func doctor(winePath: String?) async throws -> DoctorReport {
-    try await runJSON(arguments: globalArguments(winePath) + ["doctor", "--json"])
+  public func doctor() async throws -> DoctorReport {
+    try await runJSON(arguments: ["doctor", "--json"])
   }
 
   public func inspect(executable: URL) async throws -> PEReport {
@@ -82,20 +78,30 @@ public struct RuntimeClient: Sendable {
     ])
   }
 
+  public func installLatestDxmt() async throws -> DxmtStatus {
+    try await runJSON(arguments: ["graphics", "dxmt", "install-latest", "--json"])
+  }
+
+  public func updateDxmt() async throws -> DxmtStatus {
+    try await runJSON(arguments: ["graphics", "dxmt", "update", "--json"])
+  }
+
   public func removeDxmt() async throws {
     _ = try await run(arguments: ["graphics", "dxmt", "remove"])
   }
 
-  public func steamStatus(winePath: String? = nil) async throws -> SteamStatus {
-    try await runJSON(arguments: globalArguments(winePath) + ["steam", "status", "--json"])
+  public func steamStatus() async throws -> SteamStatus {
+    try await runJSON(arguments: ["steam", "status", "--json"])
   }
 
-  public func installSteam(winePath: String?, installer: URL? = nil) async throws -> SteamStatus {
-    var arguments = globalArguments(winePath) + ["steam", "install", "--json"]
+  public func installSteam(
+    installer: URL? = nil
+  ) -> AsyncThrowingStream<RuntimeEvent, Error> {
+    var arguments = ["steam", "install", "--json"]
     if let installer {
       arguments += ["--installer", installer.path]
     }
-    return try await runJSON(arguments: arguments)
+    return stream(arguments: arguments)
   }
 
   public func steamGames() async throws -> SteamLibrary {
@@ -150,11 +156,10 @@ public struct RuntimeClient: Sendable {
   }
 
   public func startSteam(
-    winePath: String?,
-    backend: GraphicsBackendPreference = .wined3d
+    backend: GraphicsBackendPreference = .auto
   ) -> AsyncThrowingStream<RuntimeEvent, Error> {
     stream(
-      arguments: globalArguments(winePath) + [
+      arguments: [
         "steam", "start",
         "--backend", backend.rawValue,
         "--json",
@@ -162,11 +167,10 @@ public struct RuntimeClient: Sendable {
   }
 
   public func restartSteam(
-    winePath: String?,
-    backend: GraphicsBackendPreference = .wined3d
+    backend: GraphicsBackendPreference = .auto
   ) -> AsyncThrowingStream<RuntimeEvent, Error> {
     stream(
-      arguments: globalArguments(winePath) + [
+      arguments: [
         "steam", "restart",
         "--backend", backend.rawValue,
         "--json",
@@ -175,11 +179,10 @@ public struct RuntimeClient: Sendable {
 
   public func launchSteamGame(
     appID: UInt32,
-    winePath: String?,
     backend: GraphicsBackendPreference
   ) -> AsyncThrowingStream<RuntimeEvent, Error> {
     stream(
-      arguments: globalArguments(winePath) + [
+      arguments: [
         "steam", "run",
         "--app-id", String(appID),
         "--backend", backend.rawValue,
@@ -187,31 +190,28 @@ public struct RuntimeClient: Sendable {
       ])
   }
 
-  public func stopSteam(winePath: String?) async throws {
-    _ = try await run(arguments: globalArguments(winePath) + ["steam", "stop"])
+  public func stopSteam() async throws {
+    _ = try await run(arguments: ["steam", "stop"])
   }
 
-  public func resetSteam(winePath: String?) async throws {
-    _ = try await run(arguments: globalArguments(winePath) + ["steam", "reset"])
+  public func resetSteam() async throws {
+    _ = try await run(arguments: ["steam", "reset"])
   }
 
-  public func resetPrefix(gameID: UUID, winePath: String?) async throws {
-    _ = try await run(
-      arguments: globalArguments(winePath) + ["prefix", "reset", "--game-id", gameID.uuidString])
+  public func resetPrefix(gameID: UUID) async throws {
+    _ = try await run(arguments: ["prefix", "reset", "--game-id", gameID.uuidString])
   }
 
-  public func stop(gameID: UUID, winePath: String?) async throws {
-    _ = try await run(
-      arguments: globalArguments(winePath) + ["stop", "--game-id", gameID.uuidString])
+  public func stop(gameID: UUID) async throws {
+    _ = try await run(arguments: ["stop", "--game-id", gameID.uuidString])
   }
 
   public func launch(
     game: GameRecord,
-    winePath: String?,
     backend: GraphicsBackendPreference
   ) -> AsyncThrowingStream<RuntimeEvent, Error> {
     stream(
-      arguments: globalArguments(winePath) + [
+      arguments: [
         "launch",
         "--game-id", game.id.uuidString,
         "--executable", game.executablePath,
@@ -322,12 +322,6 @@ public struct RuntimeClient: Sendable {
     }.value
   }
 
-  private func globalArguments(_ winePath: String?) -> [String] {
-    guard let winePath, !winePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-      return []
-    }
-    return ["--wine", winePath]
-  }
 }
 
 private struct LineFramer {

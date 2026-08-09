@@ -1,11 +1,32 @@
 # Security
 
-DarwinPlay executes Windows software and should treat all imported executables as untrusted.
+DarwinPlay executes Windows software and treats imported executables and runtime archives as untrusted input.
 
-The runtime removes the default Wine `Z:` mapping when creating prefixes. Manually imported games receive only an explicit `G:` mapping to their executable directory. Steam receives the normal Wine `C:` drive inside its dedicated prefix and can use additional drives only when mappings exist in that prefix.
+## DarwinWine artifacts
 
-The Steam installer is downloaded over HTTPS from the Steam CDN with redirects restricted to HTTPS. The downloaded file is validated as a PE executable before Wine runs it. Users can provide a local installer explicitly instead of downloading one.
+DarwinPlay accepts only DarwinWine runtime archives selected explicitly by the user. Before activation it:
 
-DarwinPlay never accepts Steam credentials, Steam Guard codes or session tokens. Authentication is performed entirely in the official Windows Steam client running under Wine.
+- lists archive contents and rejects absolute paths and parent traversal;
+- extracts into a private staging directory;
+- requires schema-2 `runtime.json` identifying `DarwinWine` and an `x86_64` architecture;
+- validates relative entrypoint paths;
+- requires the declared `wine` and `wineserver` files;
+- checks the runtime-reported Wine version against the manifest;
+- creates a disposable prefix with `wineboot`;
+- activates the runtime atomically only after the probe succeeds.
 
-Runtime component updates should be distributed with cryptographic manifests before enabling unattended component updates. DXMT installation currently requires an explicit local package selected by the user.
+DarwinPlay does not execute Homebrew installers, search PATH for another Wine, invoke Sikarugir, or accept an arbitrary Wine executable override.
+
+DarwinWine source/build security belongs to the separate DarwinWine repository. DarwinPlay consumes only its packaged output.
+
+## Prefix isolation
+
+The runtime removes Wine's default `Z:` mapping from managed prefixes. Imported games receive explicit directory mappings. Steam setup receives only a temporary installer mapping.
+
+## Credentials
+
+Steam authentication remains inside the Windows Steam client. DarwinPlay does not collect, proxy, persist or inspect Steam credentials.
+
+## Graphics components
+
+DXMT is staged and validated separately from DarwinWine. Installing or removing DXMT must not mutate the DarwinWine runtime artifact.

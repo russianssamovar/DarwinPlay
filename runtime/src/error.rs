@@ -5,12 +5,10 @@ pub type Result<T> = std::result::Result<T, AppError>;
 
 #[derive(Debug, Error)]
 pub enum AppError {
-    #[error("Wine executable was not found. Set --wine, DARWINPLAY_WINE, or add wine to PATH")]
-    WineNotFound,
-    #[error("Homebrew was not found. Install Homebrew before using managed Wine installation")]
-    HomebrewNotFound,
-    #[error("wineserver executable was not found next to Wine or in PATH")]
-    WineServerNotFound,
+    #[error("DarwinWine runtime is not installed. Install a DarwinWine runtime artifact first")]
+    RuntimeNotFound,
+    #[error("DarwinWine runtime error: {0}")]
+    Runtime(String),
     #[error("invalid game id: {0}")]
     InvalidGameId(String),
     #[error("invalid PE file: {0}")]
@@ -19,6 +17,8 @@ pub enum AppError {
     DxmtNotInstalled,
     #[error("Wine prefix is incomplete or corrupted: {0}. Reset the affected prefix and try again")]
     CorruptPrefix(String),
+    #[error("Wine prefix was created with {0}, but DarwinWine is now {1}. Reset the affected prefix after a runtime-incompatible update")]
+    PrefixRuntimeMismatch(String, String),
     #[error("Steam is not installed in the DarwinPlay Wine prefix")]
     SteamNotInstalled,
     #[error("Steam installer completed but steam.exe was not found")]
@@ -33,6 +33,8 @@ pub enum AppError {
     InvalidCompatibilityProfile(String),
     #[error("DXMT package is missing required file: {0}")]
     DxmtPackageMissing(String),
+    #[error("DXMT release error: {0}")]
+    DxmtRelease(String),
     #[error("path is not a directory: {0}")]
     InvalidDirectory(String),
     #[error("process failed: {0}")]

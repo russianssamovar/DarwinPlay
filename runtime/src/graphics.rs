@@ -4,14 +4,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 const DXMT_COMPONENT: &str = "dxmt";
 const DXMT_MANIFEST: &str = "manifest.json";
+const DXMT_RELEASE_API: &str = "https://api.github.com/repos/3Shain/dxmt/releases/latest";
+const DXMT_MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GraphicsBackend {
     Auto,
+    #[serde(rename = "wined3d")]
     WineD3d,
     Dxmt,
 }
@@ -30,6 +34,10 @@ pub struct DxmtManifest {
     pub mode: DxmtMode,
     pub source_name: String,
     pub has_d3d10core: bool,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub managed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,6 +48,8 @@ pub struct DxmtStatus {
     pub mode: Option<DxmtMode>,
     pub source_name: Option<String>,
     pub has_d3d10core: bool,
+    pub version: Option<String>,
+    pub managed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +88,8 @@ impl GraphicsManager {
                 mode: None,
                 source_name: None,
                 has_d3d10core: false,
+                version: None,
+                managed: false,
             });
         }
 
@@ -90,10 +102,73 @@ impl GraphicsManager {
             mode: Some(manifest.mode),
             source_name: Some(manifest.source_name),
             has_d3d10core: manifest.has_d3d10core,
+            version: manifest.version,
+            managed: manifest.managed,
         })
     }
 
     pub fn install_dxmt(&self, source: &Path, mode: DxmtMode) -> Result<DxmtStatus> {
+        let source_name = source
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| source.display().to_string());
+        self.install_dxmt_package(source, mode, source_name, None, false)
+    }
+
+    pub fn install_latest_dxmt(&self) -> Result<DxmtStatus> {
+        let release = fetch_latest_dxmt_release()?;
+        let asset = select_builtin_asset(&release)?;
+        if asset.size == 0 || asset.size > DXMT_MAX_ASSET_BYTES {
+            return Err(AppError::DxmtRelease(format!(
+                "DXMT asset size is outside the allowed range: {} bytes",
+                asset.size
+            )));
+        }
+
+        let downloads = application_support()?.join("downloads/dxmt");
+        fs::create_dir_all(&downloads)?;
+        let archive = downloads.join(&asset.name);
+        let staging_archive = downloads.join(format!(".{}.{}.tmp", asset.name, std::process::id()));
+        remove_file_if_exists(&staging_archive)?;
+        download_file(&asset.browser_download_url, &staging_archive)?;
+        if fs::metadata(&staging_archive)?.len() != asset.size {
+            let _ = fs::remove_file(&staging_archive);
+            return Err(AppError::DxmtRelease("downloaded DXMT asset size does not match GitHub metadata".into()));
+        }
+        if let Some(digest) = asset.digest.as_deref() {
+            verify_sha256(&staging_archive, digest)?;
+        }
+        remove_file_if_exists(&archive)?;
+        fs::rename(&staging_archive, &archive)?;
+
+        let extract_root = self.root.join(format!(".dxmt-extract-{}", std::process::id()));
+        remove_path(&extract_root)?;
+        fs::create_dir_all(&extract_root)?;
+        let extract_result = extract_tar_gz(&archive, &extract_root);
+        if let Err(error) = extract_result {
+            let _ = remove_path(&extract_root);
+            return Err(error);
+        }
+        let package_root = find_dxmt_package_root(&extract_root, 4)?;
+        let result = self.install_dxmt_package(
+            &package_root,
+            DxmtMode::Builtin,
+            asset.name.clone(),
+            Some(release.tag_name),
+            true,
+        );
+        let _ = remove_path(&extract_root);
+        result
+    }
+
+    fn install_dxmt_package(
+        &self,
+        source: &Path,
+        mode: DxmtMode,
+        source_name: String,
+        version: Option<String>,
+        managed: bool,
+    ) -> Result<DxmtStatus> {
         let package = DxmtPackage::discover(source)?;
         let target = self.dxmt_root();
         let staging = self.root.join(format!(".{DXMT_COMPONENT}-staging-{}", std::process::id()));
@@ -101,25 +176,23 @@ impl GraphicsManager {
 
         remove_path(&staging)?;
         remove_path(&backup)?;
-        fs::create_dir_all(staging.join("x86_64-unix"))?;
-        fs::create_dir_all(staging.join("x86_64-windows"))?;
-
-        copy_file(&package.winemetal_so, &staging.join("x86_64-unix/winemetal.so"))?;
-        copy_file(&package.winemetal_dll, &staging.join("x86_64-windows/winemetal.dll"))?;
-        copy_file(&package.d3d11, &staging.join("x86_64-windows/d3d11.dll"))?;
-        copy_file(&package.dxgi, &staging.join("x86_64-windows/dxgi.dll"))?;
-        if let Some(d3d10core) = package.d3d10core.as_ref() {
-            copy_file(d3d10core, &staging.join("x86_64-windows/d3d10core.dll"))?;
+        copy_directory(&source.join("x86_64-unix"), &staging.join("x86_64-unix"))?;
+        copy_directory(
+            &source.join("x86_64-windows"),
+            &staging.join("x86_64-windows"),
+        )?;
+        let i386_windows = source.join("i386-windows");
+        if i386_windows.is_dir() {
+            copy_directory(&i386_windows, &staging.join("i386-windows"))?;
         }
 
         let manifest = DxmtManifest {
-            schema_version: 1,
+            schema_version: 2,
             mode,
-            source_name: source
-                .file_name()
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_else(|| source.display().to_string()),
+            source_name,
             has_d3d10core: package.d3d10core.is_some(),
+            version,
+            managed,
         };
         fs::write(
             staging.join(DXMT_MANIFEST),
@@ -164,6 +237,21 @@ impl GraphicsManager {
         }
     }
 
+    pub fn prepare_steam_ui(
+        &self,
+        _requested: GraphicsBackend,
+        prefix: &Path,
+    ) -> Result<LaunchGraphics> {
+        // Steam's embedded CEF is intentionally isolated from game renderers.
+        // Keep the Steam UI on WineD3D/system composition; DXMT remains a game backend.
+        restore_managed_dlls(prefix)?;
+        Ok(LaunchGraphics::wined3d())
+    }
+
+    pub fn resolve_steam_ui_backend(&self, _requested: GraphicsBackend) -> Result<GraphicsBackend> {
+        Ok(GraphicsBackend::WineD3d)
+    }
+
     fn resolve_backend(
         &self,
         requested: GraphicsBackend,
@@ -195,27 +283,23 @@ impl GraphicsManager {
         let system32 = prefix.join("drive_c/windows/system32");
         fs::create_dir_all(&system32)?;
         backup_managed_dlls(prefix)?;
-        install_managed_dll(
-            prefix,
-            "winemetal.dll",
-            &root.join("x86_64-windows/winemetal.dll"),
-        )?;
 
         let mut environment = BTreeMap::new();
-        let dll_path = format!(
-            "{}:{}",
-            root.join("x86_64-windows").display(),
-            root.join("x86_64-unix").display()
-        );
-        environment.insert("WINEDLLPATH".to_string(), dll_path);
 
         match manifest.mode {
             DxmtMode::Builtin => {
-                restore_managed_dll(prefix, "d3d11.dll")?;
-                restore_managed_dll(prefix, "dxgi.dll")?;
-                restore_managed_dll(prefix, "d3d10core.dll")?;
+                restore_managed_dlls(prefix)?;
+                environment.insert(
+                    "WINEDLLPATH_PREPEND".to_string(),
+                    root.display().to_string(),
+                );
             }
             DxmtMode::Native => {
+                install_managed_dll(
+                    prefix,
+                    "winemetal.dll",
+                    &root.join("x86_64-windows/winemetal.dll"),
+                )?;
                 install_managed_dll(prefix, "d3d11.dll", &root.join("x86_64-windows/d3d11.dll"))?;
                 install_managed_dll(prefix, "dxgi.dll", &root.join("x86_64-windows/dxgi.dll"))?;
                 if manifest.has_d3d10core {
@@ -237,6 +321,9 @@ impl GraphicsManager {
         let runtime_root = application_support()?;
         let log_path = runtime_root.join("logs").join(game_id).join("dxmt");
         let shader_cache = runtime_root.join("shader-cache").join(game_id).join("dxmt");
+        if game_id == "steam-ui" {
+            remove_path(&log_path)?;
+        }
         fs::create_dir_all(&log_path)?;
         fs::create_dir_all(&shader_cache)?;
         environment.insert("DXMT_LOG_LEVEL".to_string(), "info".to_string());
@@ -362,6 +449,24 @@ fn restore_managed_dll(prefix: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn copy_directory(source: &Path, target: &Path) -> Result<()> {
+    if !source.is_dir() {
+        return Err(AppError::InvalidDirectory(source.display().to_string()));
+    }
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_directory(&source_path, &target_path)?;
+        } else if source_path.is_file() {
+            copy_file(&source_path, &target_path)?;
+        }
+    }
+    Ok(())
+}
+
 fn copy_file(source: &Path, target: &Path) -> Result<()> {
     if !source.is_file() {
         return Err(AppError::InvalidFile(source.display().to_string()));
@@ -392,6 +497,168 @@ fn remove_path(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+    digest: Option<String>,
+}
+
+
+fn select_builtin_asset(release: &GithubRelease) -> Result<&GithubAsset> {
+    release
+        .assets
+        .iter()
+        .filter(|asset| {
+            let name = asset.name.to_ascii_lowercase();
+            name.contains("builtin") && name.ends_with(".tar.gz")
+        })
+        .min_by_key(|asset| asset.name.len())
+        .ok_or_else(|| AppError::DxmtRelease("latest DXMT release has no builtin tar.gz asset".into()))
+}
+
+fn fetch_latest_dxmt_release() -> Result<GithubRelease> {
+    let output = Command::new("/usr/bin/curl")
+        .arg("--fail")
+        .arg("--location")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--proto")
+        .arg("=https")
+        .arg("--tlsv1.2")
+        .arg("--header")
+        .arg("Accept: application/vnd.github+json")
+        .arg("--header")
+        .arg("User-Agent: DarwinPlay/0.8")
+        .arg(DXMT_RELEASE_API)
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(AppError::DxmtRelease(String::from_utf8_lossy(&output.stderr).trim().to_string()));
+    }
+    serde_json::from_slice(&output.stdout).map_err(Into::into)
+}
+
+fn download_file(url: &str, destination: &Path) -> Result<()> {
+    if !url.starts_with("https://github.com/") && !url.starts_with("https://objects.githubusercontent.com/") {
+        return Err(AppError::DxmtRelease("DXMT asset URL is not an allowed GitHub HTTPS URL".into()));
+    }
+    let status = Command::new("/usr/bin/curl")
+        .arg("--fail")
+        .arg("--location")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--proto")
+        .arg("=https")
+        .arg("--tlsv1.2")
+        .arg("--output")
+        .arg(destination)
+        .arg(url)
+        .stdin(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(AppError::DxmtRelease("DXMT download failed".into()));
+    }
+    Ok(())
+}
+
+fn verify_sha256(path: &Path, digest: &str) -> Result<()> {
+    let expected = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| AppError::DxmtRelease(format!("unsupported DXMT digest: {digest}")))?;
+    if expected.len() != 64 || !expected.bytes().all(|value| value.is_ascii_hexdigit()) {
+        return Err(AppError::DxmtRelease("invalid DXMT sha256 digest from GitHub".into()));
+    }
+    let output = Command::new("/usr/bin/shasum")
+        .arg("-a")
+        .arg("256")
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(AppError::DxmtRelease("failed to calculate DXMT sha256".into()));
+    }
+    let actual = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if actual != expected.to_ascii_lowercase() {
+        return Err(AppError::DxmtRelease("DXMT sha256 does not match GitHub metadata".into()));
+    }
+    Ok(())
+}
+
+fn extract_tar_gz(archive: &Path, destination: &Path) -> Result<()> {
+    validate_tar_entries(archive)?;
+    let status = Command::new("/usr/bin/tar")
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(destination)
+        .stdin(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(AppError::DxmtRelease("failed to extract DXMT archive".into()));
+    }
+    Ok(())
+}
+
+fn validate_tar_entries(archive: &Path) -> Result<()> {
+    let output = Command::new("/usr/bin/tar")
+        .arg("-tzf")
+        .arg(archive)
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(AppError::DxmtRelease("DXMT archive could not be inspected".into()));
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let path = Path::new(line);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(AppError::DxmtRelease("DXMT archive contains an unsafe path".into()));
+        }
+    }
+    Ok(())
+}
+
+fn find_dxmt_package_root(root: &Path, max_depth: usize) -> Result<PathBuf> {
+    fn visit(path: &Path, depth: usize, max_depth: usize) -> Option<PathBuf> {
+        if path.join("x86_64-unix/winemetal.so").is_file()
+            && path.join("x86_64-windows/winemetal.dll").is_file()
+            && path.join("x86_64-windows/d3d11.dll").is_file()
+            && path.join("x86_64-windows/dxgi.dll").is_file()
+        {
+            return Some(path.to_path_buf());
+        }
+        if depth >= max_depth {
+            return None;
+        }
+        let mut directories: Vec<_> = fs::read_dir(path).ok()?.flatten()
+            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            .collect();
+        directories.sort_by_key(|entry| entry.file_name());
+        for entry in directories {
+            if let Some(found) = visit(&entry.path(), depth + 1, max_depth) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    visit(root, 0, max_depth).ok_or_else(|| AppError::DxmtRelease("extracted DXMT archive has an unexpected layout".into()))
 }
 
 #[cfg(test)]
@@ -455,6 +722,29 @@ mod tests {
         assert_eq!(fs::read(system32.join("d3d11.dll")).unwrap(), b"wine".to_vec());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selects_builtin_release_asset() {
+        let release = GithubRelease {
+            tag_name: "v0.80".to_string(),
+            assets: vec![
+                GithubAsset {
+                    name: "dxmt-v0.80-native.tar.gz".to_string(),
+                    browser_download_url: "https://github.com/example/native".to_string(),
+                    size: 1,
+                    digest: None,
+                },
+                GithubAsset {
+                    name: "dxmt-v0.80-builtin.tar.gz".to_string(),
+                    browser_download_url: "https://github.com/example/builtin".to_string(),
+                    size: 1,
+                    digest: Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                },
+            ],
+        };
+
+        assert_eq!(select_builtin_asset(&release).unwrap().name, "dxmt-v0.80-builtin.tar.gz");
     }
 
     #[test]
