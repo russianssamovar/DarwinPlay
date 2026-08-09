@@ -5,6 +5,7 @@ mod error;
 mod events;
 mod pe;
 mod prefix;
+mod release;
 mod steam;
 mod vdf;
 mod wine;
@@ -17,6 +18,7 @@ use error::Result;
 use events::write_json;
 use pe::inspect_pe;
 use prefix::PrefixManager;
+use release::install_latest_darwinwine;
 use steam::SteamManager;
 use wine::{install_darwinwine, remove_darwinwine, runtime_status, WineRuntime};
 
@@ -51,6 +53,12 @@ fn run() -> Result<()> {
                     if let Some(error) = status.probe_error { println!("{error}"); }
                 } else {
                     println!("DarwinWine is not installed");
+                }
+            }
+            RuntimeCommand::InstallLatest { json } => {
+                let status = install_latest_darwinwine(json)?;
+                if !json {
+                    println!("DarwinWine: {}", status.darwin_wine_version.as_deref().unwrap_or("unknown"));
                 }
             }
             RuntimeCommand::Install { archive, json } => {

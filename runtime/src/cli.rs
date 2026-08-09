@@ -51,6 +51,11 @@ pub enum RuntimeCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Download and install the newest published DarwinWine runtime.
+    InstallLatest {
+        #[arg(long)]
+        json: bool,
+    },
     Install {
         #[arg(long)]
         archive: PathBuf,

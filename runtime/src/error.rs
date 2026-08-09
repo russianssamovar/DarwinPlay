@@ -21,6 +21,8 @@ pub enum AppError {
     SteamNotInstalled,
     #[error("Steam installer completed but steam.exe was not found")]
     SteamInstallationMissing,
+    #[error("DarwinWine release error: {0}")]
+    Release(String),
     #[error("Steam installer download failed")]
     SteamInstallerDownloadFailed,
     #[error("Steam app {0} is not installed")]
