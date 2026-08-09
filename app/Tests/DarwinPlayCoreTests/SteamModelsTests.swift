@@ -5,7 +5,7 @@ import XCTest
 final class SteamModelsTests: XCTestCase {
   func testDecodesSteamStatus() throws {
     let data = Data(
-      #"{"installed":true,"running":true,"prefix":"/tmp/steam","steamPath":"/tmp/steam/steam.exe","gamesInstalled":2,"uiPolicyCurrent":true,"uiBackend":"dxmt","uiDxmtVersion":"v0.80","uiBackendVerified":false,"prefixRuntimeCompatible":false,"prefixRuntimeVersion":"wine-11.0"}"#
+      #"{"installed":true,"running":true,"prefix":"/tmp/steam","steamPath":"/tmp/steam/steam.exe","gamesInstalled":2,"uiPolicyCurrent":true,"prefixRuntimeCompatible":false,"prefixRuntimeVersion":"wine-11.0"}"#
         .utf8)
     let status = try JSONDecoder().decode(SteamStatus.self, from: data)
 
@@ -13,9 +13,6 @@ final class SteamModelsTests: XCTestCase {
     XCTAssertTrue(status.running)
     XCTAssertEqual(status.gamesInstalled, 2)
     XCTAssertTrue(status.uiPolicyCurrent)
-    XCTAssertEqual(status.uiBackend, .dxmt)
-    XCTAssertEqual(status.uiDxmtVersion, "v0.80")
-    XCTAssertFalse(status.uiBackendVerified)
     XCTAssertFalse(status.prefixRuntimeCompatible)
     XCTAssertEqual(status.prefixRuntimeVersion, "wine-11.0")
   }
@@ -43,26 +40,26 @@ final class SteamModelsTests: XCTestCase {
 
   func testDecodesSteamCompatibilityProfile() throws {
     let data = Data(
-      #"{"appId":292030,"name":"The Witcher 3","backendOverride":"inherit","selectedExecutable":null,"launchArguments":["-dx11"],"recommendedExecutable":"bin/x64/witcher3.exe","recommendedBackend":"dxmt","effectiveBackend":"dxmt","compatibility":"promising","reasons":["Direct3D 11 imports detected"],"candidates":[{"relativePath":"bin/x64/witcher3.exe","architecture":"x86_64","subsystem":"windows-gui","graphicsApis":["Direct3D 11 / DXGI"],"imports":["d3d11.dll"],"score":357,"kind":"game","recommendedBackend":"dxmt","compatibility":"promising","reasons":["Direct3D 11 imports detected"]}],"dxmtInstalled":true}"#
+      #"{"appId":292030,"name":"The Witcher 3","selectedExecutable":null,"launchArguments":["-dx11"],"recommendedExecutable":"bin/x64/witcher3.exe","compatibility":"promising","reasons":["Direct3D 11 imports detected"],"candidates":[{"relativePath":"bin/x64/witcher3.exe","architecture":"x86_64","subsystem":"windows-gui","graphicsApis":["Direct3D 11 / DXGI"],"score":357,"kind":"game","compatibility":"promising","reasons":["Direct3D 11 imports detected"]}]}"#
         .utf8)
     let profile = try JSONDecoder().decode(SteamCompatibilityProfile.self, from: data)
 
     XCTAssertEqual(profile.appId, 292030)
-    XCTAssertEqual(profile.backendOverride, .inherit)
-    XCTAssertEqual(profile.recommendedBackend, .dxmt)
-    XCTAssertEqual(profile.effectiveBackend, .dxmt)
+    XCTAssertEqual(profile.launchArguments, ["-dx11"])
+    XCTAssertEqual(profile.recommendedExecutable, "bin/x64/witcher3.exe")
     XCTAssertEqual(profile.compatibility, .promising)
     XCTAssertEqual(profile.candidates.first?.relativePath, "bin/x64/witcher3.exe")
   }
 
   func testDecodesUnsupportedD3D12Profile() throws {
     let data = Data(
-      #"{"appId":1091500,"name":"Game","backendOverride":"auto","selectedExecutable":"game_dx12.exe","launchArguments":[],"recommendedExecutable":"game_dx12.exe","recommendedBackend":null,"effectiveBackend":"wined3d","compatibility":"unsupported","reasons":["Direct3D 12 imports detected"],"candidates":[],"dxmtInstalled":true}"#
+      #"{"appId":1091500,"name":"Game","selectedExecutable":"game_dx12.exe","launchArguments":[],"recommendedExecutable":"game_dx12.exe","compatibility":"unsupported","reasons":["Direct3D 12 imports detected"],"candidates":[]}"#
         .utf8)
     let profile = try JSONDecoder().decode(SteamCompatibilityProfile.self, from: data)
 
     XCTAssertEqual(profile.compatibility, .unsupported)
-    XCTAssertNil(profile.recommendedBackend)
+    XCTAssertEqual(profile.selectedExecutable, "game_dx12.exe")
+    XCTAssertTrue(profile.candidates.isEmpty)
   }
   func testDecodesWineProbeFailure() throws {
     let data = Data(

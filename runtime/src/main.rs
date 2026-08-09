@@ -3,7 +3,6 @@ mod cli;
 mod compatibility;
 mod error;
 mod events;
-mod graphics;
 mod pe;
 mod prefix;
 mod steam;
@@ -12,52 +11,18 @@ mod wine;
 
 use clap::Parser;
 use cli::{
-    BackendOverrideArg, Cli, Command, DxmtCommand, DxmtModeArg, GraphicsBackendArg,
-    GraphicsCommand, PrefixCommand, RuntimeCommand, SteamCommand, SteamProfileCommand,
+    Cli, Command, PrefixCommand, RuntimeCommand, SteamCommand, SteamProfileCommand,
 };
-use compatibility::BackendOverride;
 use error::Result;
 use events::write_json;
-use graphics::{DxmtMode, GraphicsBackend, GraphicsManager};
 use pe::inspect_pe;
 use prefix::PrefixManager;
 use steam::SteamManager;
 use wine::{install_darwinwine, remove_darwinwine, runtime_status, WineRuntime};
 
-impl From<GraphicsBackendArg> for GraphicsBackend {
-    fn from(value: GraphicsBackendArg) -> Self {
-        match value {
-            GraphicsBackendArg::Auto => Self::Auto,
-            GraphicsBackendArg::Wined3d => Self::WineD3d,
-            GraphicsBackendArg::Dxmt => Self::Dxmt,
-        }
-    }
-}
-
-impl From<BackendOverrideArg> for BackendOverride {
-    fn from(value: BackendOverrideArg) -> Self {
-        match value {
-            BackendOverrideArg::Inherit => Self::Inherit,
-            BackendOverrideArg::Auto => Self::Auto,
-            BackendOverrideArg::Wined3d => Self::Wined3d,
-            BackendOverrideArg::Dxmt => Self::Dxmt,
-        }
-    }
-}
-
-impl From<DxmtModeArg> for DxmtMode {
-    fn from(value: DxmtModeArg) -> Self {
-        match value {
-            DxmtModeArg::Builtin => Self::Builtin,
-            DxmtModeArg::Native => Self::Native,
-        }
-    }
-}
-
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let prefixes = PrefixManager::new()?;
-    let graphics = GraphicsManager::new()?;
     let steam = SteamManager::new()?;
 
     match cli.command {
@@ -136,41 +101,6 @@ fn run() -> Result<()> {
                 prefixes.reset(&game_id)?;
             }
         },
-        Command::Graphics { command } => match command {
-            GraphicsCommand::Dxmt { command } => match command {
-                DxmtCommand::Status { json } => {
-                    let status = graphics.dxmt_status()?;
-                    if json {
-                        write_json(&status)?;
-                    } else if status.installed {
-                        println!("DXMT installed: {}", status.root.as_deref().unwrap_or("unknown"));
-                        println!("Mode: {:?}", status.mode.unwrap());
-                    } else {
-                        println!("DXMT is not installed");
-                    }
-                }
-                DxmtCommand::Install { source, mode, json } => {
-                    let status = graphics.install_dxmt(&source, mode.into())?;
-                    if json {
-                        write_json(&status)?;
-                    } else {
-                        println!("DXMT installed: {}", status.root.as_deref().unwrap_or("unknown"));
-                    }
-                }
-                DxmtCommand::InstallLatest { json } | DxmtCommand::Update { json } => {
-                    let status = graphics.install_latest_dxmt()?;
-                    if json {
-                        write_json(&status)?;
-                    } else {
-                        println!("DXMT installed: {}", status.root.as_deref().unwrap_or("unknown"));
-                        if let Some(version) = status.version.as_deref() {
-                            println!("Version: {version}");
-                        }
-                    }
-                }
-                DxmtCommand::Remove => graphics.remove_dxmt()?,
-            },
-        },
         Command::Steam { command } => match command {
             SteamCommand::Status { json } => {
                 let runtime = WineRuntime::discover().ok();
@@ -181,19 +111,13 @@ fn run() -> Result<()> {
                     println!("Steam installed: {}", status.steam_path.as_deref().unwrap_or("unknown"));
                     println!("Steam running: {}", status.running);
                     println!("Installed games: {}", status.games_installed);
-                    if let Some(backend) = status.ui_backend {
-                        println!("Steam UI backend: {:?}", backend);
-                    }
-                    if let Some(version) = status.ui_dxmt_version.as_deref() {
-                        println!("Steam UI DXMT: {version}");
-                    }
                 } else {
                     println!("Steam is not installed");
                 }
             }
             SteamCommand::Install { installer, json } => {
                 let runtime = WineRuntime::discover()?;
-                let status = steam.install(&runtime, &graphics, installer.as_deref(), json)?;
+                let status = steam.install(&runtime, installer.as_deref(), json)?;
                 if !json {
                     println!("Steam installed: {}", status.steam_path.as_deref().unwrap_or("unknown"));
                 }
@@ -219,41 +143,27 @@ fn run() -> Result<()> {
                     println!("CEF --disable-gpu-compositing observed: {}", diagnostics.disable_gpu_compositing_observed);
                     println!("Steam GPU acceleration registry setting disabled: {}", diagnostics.registry_gpu_acceleration_disabled);
                     println!("Vulkan mentioned in CEF/WebHelper logs: {}", diagnostics.vulkan_observed);
-                    println!("DXMT log detected: {}", diagnostics.dxmt_log_detected);
-                    if let Some(backend) = diagnostics.session_backend {
-                        println!("Recorded Steam UI backend: {:?}", backend);
-                    }
-                    if let Some(version) = diagnostics.session_dxmt_version.as_deref() {
-                        println!("Recorded DXMT version: {version}");
-                    }
-                    println!("DXMT activation: {}", diagnostics.dxmt_activation_state);
-                    if let Some(path) = diagnostics.dxmt_log_path.as_deref() {
-                        println!("DXMT log path: {path}");
-                    }
+                    println!("CEF --in-process-gpu observed: {}", diagnostics.in_process_gpu_observed);
                     if let Some(command_line) = diagnostics.webhelper_command_line {
                         println!("WebHelper command line: {command_line}");
                     }
                 }
             }
-            SteamCommand::Start { backend, json } => {
+            SteamCommand::Start { json } => {
                 let runtime = WineRuntime::discover()?;
-                steam.start(&runtime, &graphics, backend.into(), json)?;
+                steam.start(&runtime, json)?;
             }
-            SteamCommand::Restart { backend, json } => {
+            SteamCommand::Restart { json } => {
                 let runtime = WineRuntime::discover()?;
-                steam.restart(&runtime, &graphics, backend.into(), json)?;
+                steam.restart(&runtime, json)?;
             }
-            SteamCommand::Run { app_id, backend, json } => {
+            SteamCommand::Run { app_id, json } => {
                 let runtime = WineRuntime::discover()?;
-                steam.launch_game(&runtime, &graphics, app_id, backend.into(), json)?;
+                steam.launch_game(&runtime, app_id, json)?;
             }
             SteamCommand::Profile { command } => match command {
-                SteamProfileCommand::Show {
-                    app_id,
-                    fallback_backend,
-                    json,
-                } => {
-                    let profile = steam.profile(&graphics, app_id, fallback_backend.into())?;
+                SteamProfileCommand::Show { app_id, json } => {
+                    let profile = steam.profile(app_id)?;
                     if json {
                         write_json(&profile)?;
                     } else {
@@ -262,32 +172,20 @@ fn run() -> Result<()> {
                 }
                 SteamProfileCommand::Set {
                     app_id,
-                    backend,
                     executable,
                     launch_arguments,
-                    fallback_backend,
                     json,
                 } => {
-                    let profile = steam.set_profile(
-                        &graphics,
-                        app_id,
-                        backend.into(),
-                        executable.as_deref(),
-                        launch_arguments,
-                        fallback_backend.into(),
-                    )?;
+                    let profile =
+                        steam.set_profile(app_id, executable.as_deref(), launch_arguments)?;
                     if json {
                         write_json(&profile)?;
                     } else {
                         print_profile(&profile);
                     }
                 }
-                SteamProfileCommand::Reset {
-                    app_id,
-                    fallback_backend,
-                    json,
-                } => {
-                    let profile = steam.reset_profile(&graphics, app_id, fallback_backend.into())?;
+                SteamProfileCommand::Reset { app_id, json } => {
+                    let profile = steam.reset_profile(app_id)?;
                     if json {
                         write_json(&profile)?;
                     } else {
@@ -307,16 +205,13 @@ fn run() -> Result<()> {
         Command::Launch {
             game_id,
             executable,
-            backend,
             json,
         } => {
             let runtime = WineRuntime::discover()?;
-            let report = inspect_pe(&executable)?;
+            inspect_pe(&executable)?;
             let prefix = prefixes.ensure(&runtime, &game_id)?;
             prefixes.bind_game_drive(&prefix, &executable)?;
-            let launch_graphics =
-                graphics.prepare_launch(backend.into(), &report.imports, &prefix, &game_id)?;
-            runtime.launch(&prefix, &executable, json, &launch_graphics)?;
+            runtime.launch(&prefix, &executable, json)?;
         }
         Command::Stop { game_id } => {
             let runtime = WineRuntime::discover()?;
@@ -332,7 +227,6 @@ fn print_profile(profile: &compatibility::SteamCompatibilityProfile) {
     println!("Steam AppID: {}", profile.app_id);
     println!("Game: {}", profile.name);
     println!("Compatibility: {:?}", profile.compatibility);
-    println!("Effective backend: {}", profile.effective_backend);
     println!(
         "Recommended executable: {}",
         profile.recommended_executable.as_deref().unwrap_or("unknown")

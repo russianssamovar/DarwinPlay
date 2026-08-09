@@ -5,7 +5,6 @@ struct ConsoleView: View {
     case all = "All"
     case wine = "Wine"
     case steam = "Steam"
-    case graphics = "Graphics"
     case errors = "Errors"
 
     var id: String { rawValue }
@@ -18,7 +17,7 @@ struct ConsoleView: View {
     VStack(alignment: .leading, spacing: 20) {
       LauncherPageHeader(
         title: "Console",
-        subtitle: "Wine, Steam and graphics runtime output in one place.",
+        subtitle: "Wine, Steam and runtime output in one place.",
         actions: AnyView(
           Button {
             model.clearConsole()
@@ -74,8 +73,6 @@ struct ConsoleView: View {
       model.consoleEntries.filter { $0.component == .wine }
     case .steam:
       model.consoleEntries.filter { $0.component == .steam }
-    case .graphics:
-      model.consoleEntries.filter { $0.component == .graphics }
     case .errors:
       model.consoleEntries.filter { $0.level == .error }
     }

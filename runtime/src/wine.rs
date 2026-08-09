@@ -1,7 +1,6 @@
 use crate::app_dirs::application_support;
 use crate::error::{AppError, Result};
 use crate::events::{write_json, write_progress, RuntimeEvent};
-use crate::graphics::{GraphicsBackend, LaunchGraphics};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::env;
@@ -543,7 +542,7 @@ fn run_probe_command(
     let mut command = Command::new(executable);
     command.args(arguments);
     if prefix_bootstrap {
-        configure_command(&mut command, prefix, &LaunchGraphics::wined3d(), wine);
+        configure_command(&mut command, prefix, wine);
         configure_prefix_bootstrap(&mut command);
     } else {
         command.env("WINEPREFIX", prefix);
@@ -724,7 +723,6 @@ impl WineRuntime {
         prefix: &Path,
         executable: &Path,
         json: bool,
-        graphics: &LaunchGraphics,
     ) -> Result<()> {
         let file_name = executable
             .file_name()
@@ -739,8 +737,8 @@ impl WineRuntime {
         let windows_path = format!("G:\\{file_name}");
         let mut command = Command::new(&self.wine);
         command.arg(windows_path).current_dir(parent);
-        configure_command(&mut command, prefix, graphics, &self.wine);
-        self.stream_command(command, prefix, json, graphics.backend)
+        configure_command(&mut command, prefix, &self.wine);
+        self.stream_command(command, prefix, json)
             .map(|_| ())
     }
 
@@ -750,13 +748,12 @@ impl WineRuntime {
         executable: &str,
         arguments: &[String],
         json: bool,
-        graphics: &LaunchGraphics,
     ) -> Result<i32> {
         validate_windows_executable(executable)?;
         let mut command = Command::new(&self.wine);
         command.arg(executable).args(arguments);
-        configure_command(&mut command, prefix, graphics, &self.wine);
-        self.stream_command(command, prefix, json, graphics.backend)
+        configure_command(&mut command, prefix, &self.wine);
+        self.stream_command(command, prefix, json)
     }
 
     pub fn dispatch_windows(
@@ -768,7 +765,7 @@ impl WineRuntime {
         validate_windows_executable(executable)?;
         let mut command = Command::new(&self.wine);
         command.arg(executable).args(arguments);
-        configure_command(&mut command, prefix, &LaunchGraphics::wined3d(), &self.wine);
+        configure_command(&mut command, prefix, &self.wine);
         let output = command.stdin(Stdio::null()).output()?;
         if output.status.success() {
             Ok(output.status.code().unwrap_or(0))
@@ -782,13 +779,12 @@ impl WineRuntime {
         prefix: &Path,
         executable: &str,
         arguments: &[String],
-        graphics: &LaunchGraphics,
         timeout: Duration,
     ) -> Result<()> {
         validate_windows_executable(executable)?;
         let mut command = Command::new(&self.wine);
         command.arg(executable).args(arguments);
-        configure_command(&mut command, prefix, graphics, &self.wine);
+        configure_command(&mut command, prefix, &self.wine);
         let log_path = prefix.join(".darwinplay-wine-command.log");
         let log = File::create(&log_path)?;
         let stderr = log.try_clone()?;
@@ -843,7 +839,7 @@ impl WineRuntime {
         }
         let mut command = Command::new(&self.wine);
         command.args(["tasklist.exe", "/fo", "csv", "/nh"]);
-        configure_command(&mut command, prefix, &LaunchGraphics::wined3d(), &self.wine);
+        configure_command(&mut command, prefix, &self.wine);
         let output = command.stdin(Stdio::null()).output()?;
         if !output.status.success() {
             return Err(command_failure("tasklist", &output));
@@ -885,14 +881,12 @@ impl WineRuntime {
         mut command: Command,
         prefix: &Path,
         json: bool,
-        backend: GraphicsBackend,
     ) -> Result<i32> {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn()?;
-        let backend = backend_name(backend);
 
         if json {
             let prefix_text = prefix.display().to_string();
@@ -900,13 +894,12 @@ impl WineRuntime {
                 kind: "started",
                 stream: None,
                 message: None,
-                backend: Some(backend),
                 pid: Some(child.id()),
                 exit_code: None,
                 prefix: Some(&prefix_text),
             })?;
         } else {
-            println!("Started Wine process {} with {backend}", child.id());
+            println!("Started Wine process {}", child.id());
         }
 
         let stdout = child
@@ -961,7 +954,6 @@ impl WineRuntime {
                 kind: "exited",
                 stream: None,
                 message: None,
-                backend: Some(backend),
                 pid: None,
                 exit_code: Some(exit_code),
                 prefix: None,
@@ -1013,22 +1005,13 @@ fn validate_windows_executable(value: &str) -> Result<()> {
     }
 }
 
-fn configure_command(
-    command: &mut Command,
-    prefix: &Path,
-    graphics: &LaunchGraphics,
-    wine: &Path,
-) {
+fn configure_command(command: &mut Command, prefix: &Path, wine: &Path) {
     command
         .env("WINEPREFIX", prefix)
         .env("WINEDEBUG", wine_debug())
         .env_remove("WINEDLLPATH")
         .env_remove("WINEDLLPATH_PREPEND")
-        .env_remove("WINEDLLOVERRIDES")
-        .env_remove("DXMT_LOG_LEVEL")
-        .env_remove("DXMT_LOG_PATH")
-        .env_remove("DXMT_SHADER_CACHE_PATH")
-        .envs(&graphics.environment);
+        .env_remove("WINEDLLOVERRIDES");
     configure_runtime_library_environment(command, wine);
 }
 
@@ -1061,7 +1044,6 @@ fn write_log(json: bool, stream: &str, message: &str) -> Result<()> {
             kind: "log",
             stream: Some(stream),
             message: Some(message),
-            backend: None,
             pid: None,
             exit_code: None,
             prefix: None,
@@ -1097,14 +1079,6 @@ fn process_status_description(status: &std::process::ExitStatus) -> String {
         }
     }
     "terminated without an exit code".to_string()
-}
-
-fn backend_name(backend: GraphicsBackend) -> &'static str {
-    match backend {
-        GraphicsBackend::Auto => "auto",
-        GraphicsBackend::WineD3d => "wined3d",
-        GraphicsBackend::Dxmt => "dxmt",
-    }
 }
 
 fn managed_runtime_library_directory(wine: &Path) -> Option<PathBuf> {

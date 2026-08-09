@@ -65,31 +65,6 @@ public struct RuntimeClient: Sendable {
     try await runJSON(arguments: ["inspect", executable.path, "--json"])
   }
 
-  public func dxmtStatus() async throws -> DxmtStatus {
-    try await runJSON(arguments: ["graphics", "dxmt", "status", "--json"])
-  }
-
-  public func installDxmt(source: URL, mode: DxmtMode) async throws -> DxmtStatus {
-    try await runJSON(arguments: [
-      "graphics", "dxmt", "install",
-      "--source", source.path,
-      "--mode", mode.rawValue,
-      "--json",
-    ])
-  }
-
-  public func installLatestDxmt() async throws -> DxmtStatus {
-    try await runJSON(arguments: ["graphics", "dxmt", "install-latest", "--json"])
-  }
-
-  public func updateDxmt() async throws -> DxmtStatus {
-    try await runJSON(arguments: ["graphics", "dxmt", "update", "--json"])
-  }
-
-  public func removeDxmt() async throws {
-    _ = try await run(arguments: ["graphics", "dxmt", "remove"])
-  }
-
   public func steamStatus() async throws -> SteamStatus {
     try await runJSON(arguments: ["steam", "status", "--json"])
   }
@@ -108,30 +83,22 @@ public struct RuntimeClient: Sendable {
     try await runJSON(arguments: ["steam", "games", "--json"])
   }
 
-  public func steamProfile(
-    appID: UInt32,
-    fallbackBackend: GraphicsBackendPreference
-  ) async throws -> SteamCompatibilityProfile {
+  public func steamProfile(appID: UInt32) async throws -> SteamCompatibilityProfile {
     try await runJSON(arguments: [
       "steam", "profile", "show",
       "--app-id", String(appID),
-      "--fallback-backend", fallbackBackend.rawValue,
       "--json",
     ])
   }
 
   public func saveSteamProfile(
     appID: UInt32,
-    backend: SteamBackendOverride,
     executable: String?,
-    launchArguments: [String],
-    fallbackBackend: GraphicsBackendPreference
+    launchArguments: [String]
   ) async throws -> SteamCompatibilityProfile {
     var arguments = [
       "steam", "profile", "set",
       "--app-id", String(appID),
-      "--backend", backend.rawValue,
-      "--fallback-backend", fallbackBackend.rawValue,
       "--json",
     ]
     if let executable {
@@ -143,49 +110,27 @@ public struct RuntimeClient: Sendable {
     return try await runJSON(arguments: arguments)
   }
 
-  public func resetSteamProfile(
-    appID: UInt32,
-    fallbackBackend: GraphicsBackendPreference
-  ) async throws -> SteamCompatibilityProfile {
+  public func resetSteamProfile(appID: UInt32) async throws -> SteamCompatibilityProfile {
     try await runJSON(arguments: [
       "steam", "profile", "reset",
       "--app-id", String(appID),
-      "--fallback-backend", fallbackBackend.rawValue,
       "--json",
     ])
   }
 
-  public func startSteam(
-    backend: GraphicsBackendPreference = .auto
-  ) -> AsyncThrowingStream<RuntimeEvent, Error> {
-    stream(
-      arguments: [
-        "steam", "start",
-        "--backend", backend.rawValue,
-        "--json",
-      ])
+  public func startSteam() -> AsyncThrowingStream<RuntimeEvent, Error> {
+    stream(arguments: ["steam", "start", "--json"])
   }
 
-  public func restartSteam(
-    backend: GraphicsBackendPreference = .auto
-  ) -> AsyncThrowingStream<RuntimeEvent, Error> {
-    stream(
-      arguments: [
-        "steam", "restart",
-        "--backend", backend.rawValue,
-        "--json",
-      ])
+  public func restartSteam() -> AsyncThrowingStream<RuntimeEvent, Error> {
+    stream(arguments: ["steam", "restart", "--json"])
   }
 
-  public func launchSteamGame(
-    appID: UInt32,
-    backend: GraphicsBackendPreference
-  ) -> AsyncThrowingStream<RuntimeEvent, Error> {
+  public func launchSteamGame(appID: UInt32) -> AsyncThrowingStream<RuntimeEvent, Error> {
     stream(
       arguments: [
         "steam", "run",
         "--app-id", String(appID),
-        "--backend", backend.rawValue,
         "--json",
       ])
   }
@@ -206,16 +151,12 @@ public struct RuntimeClient: Sendable {
     _ = try await run(arguments: ["stop", "--game-id", gameID.uuidString])
   }
 
-  public func launch(
-    game: GameRecord,
-    backend: GraphicsBackendPreference
-  ) -> AsyncThrowingStream<RuntimeEvent, Error> {
+  public func launch(game: GameRecord) -> AsyncThrowingStream<RuntimeEvent, Error> {
     stream(
       arguments: [
         "launch",
         "--game-id", game.id.uuidString,
         "--executable", game.executablePath,
-        "--backend", backend.rawValue,
         "--json",
       ])
   }

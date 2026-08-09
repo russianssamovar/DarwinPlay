@@ -5,7 +5,6 @@ import SwiftUI
 struct SteamDetailView: View {
   @Bindable var model: AppModel
   let game: SteamGame
-  @State private var backendOverride: SteamBackendOverride = .inherit
   @State private var selectedExecutable = ""
   @State private var launchArgumentsText = ""
 
@@ -72,18 +71,11 @@ struct SteamDetailView: View {
           .frame(maxWidth: 650, alignment: .leading)
 
         if let profile = currentProfile {
-          HStack(spacing: 8) {
-            StatusPill(
-              profile.compatibility.displayName,
-              systemImage: compatibilityIcon(profile.compatibility),
-              tone: compatibilityTone(profile.compatibility)
-            )
-            StatusPill(
-              profile.effectiveBackend.displayName,
-              systemImage: "rectangle.3.group",
-              tone: .info
-            )
-          }
+          StatusPill(
+            profile.compatibility.displayName,
+            systemImage: compatibilityIcon(profile.compatibility),
+            tone: compatibilityTone(profile.compatibility)
+          )
         }
 
         HStack(spacing: 9) {
@@ -147,24 +139,6 @@ struct SteamDetailView: View {
             }
 
             Spacer()
-
-            VStack(alignment: .leading, spacing: 5) {
-              Text("Recommended backend")
-                .font(.system(size: 10.5))
-                .foregroundStyle(DarwinPalette.textTertiary)
-              Text(profile.recommendedBackend?.displayName ?? "None")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(DarwinPalette.textPrimary)
-            }
-
-            VStack(alignment: .leading, spacing: 5) {
-              Text("Effective backend")
-                .font(.system(size: 10.5))
-                .foregroundStyle(DarwinPalette.textTertiary)
-              Text(profile.effectiveBackend.displayName)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(DarwinPalette.textPrimary)
-            }
           }
 
           if !profile.reasons.isEmpty {
@@ -202,18 +176,6 @@ struct SteamDetailView: View {
       SectionHeading("Game profile", subtitle: "Overrides apply only to this Steam AppID")
       SurfaceCard {
         VStack(alignment: .leading, spacing: 16) {
-          settingRow("Graphics backend") {
-            Picker("Graphics backend", selection: $backendOverride) {
-              ForEach(SteamBackendOverride.allCases) { backend in
-                Text(backend.displayName).tag(backend)
-              }
-            }
-            .labelsHidden()
-            .frame(width: 210)
-          }
-
-          Divider().overlay(DarwinPalette.border)
-
           VStack(alignment: .leading, spacing: 7) {
             Text("Analysis target")
               .font(.system(size: 12, weight: .semibold))
@@ -259,7 +221,6 @@ struct SteamDetailView: View {
             Button {
               Task {
                 await model.saveSteamProfile(
-                  backend: backendOverride,
                   executable: selectedExecutable.isEmpty ? nil : selectedExecutable,
                   launchArguments: launchArguments
                 )
@@ -351,18 +312,6 @@ struct SteamDetailView: View {
     .frame(minHeight: 52)
   }
 
-  private func settingRow<Content: View>(_ title: String, @ViewBuilder content: () -> Content)
-    -> some View
-  {
-    HStack {
-      Text(title)
-        .font(.system(size: 12, weight: .semibold))
-        .foregroundStyle(DarwinPalette.textPrimary)
-      Spacer()
-      content()
-    }
-  }
-
   private func metadata(_ title: String, _ value: String) -> some View {
     VStack(alignment: .leading, spacing: 3) {
       Text(title)
@@ -388,7 +337,6 @@ struct SteamDetailView: View {
 
   private func syncProfile() {
     guard let profile = currentProfile else { return }
-    backendOverride = profile.backendOverride
     selectedExecutable = profile.selectedExecutable ?? ""
     launchArgumentsText = profile.launchArguments.joined(separator: "\n")
   }
@@ -396,7 +344,6 @@ struct SteamDetailView: View {
   private func compatibilityTone(_ level: SteamCompatibilityLevel) -> StatusPill.Tone {
     switch level {
     case .promising: .success
-    case .needsComponent: .warning
     case .fallback: .info
     case .unsupported: .danger
     case .unknown: .neutral
@@ -406,7 +353,6 @@ struct SteamDetailView: View {
   private func compatibilityIcon(_ level: SteamCompatibilityLevel) -> String {
     switch level {
     case .promising: "checkmark.circle.fill"
-    case .needsComponent: "wrench.and.screwdriver.fill"
     case .fallback: "arrow.triangle.branch"
     case .unsupported: "xmark.circle.fill"
     case .unknown: "questionmark.circle"
@@ -416,7 +362,6 @@ struct SteamDetailView: View {
   private func compatibilityColor(_ level: SteamCompatibilityLevel) -> Color {
     switch level {
     case .promising: DarwinPalette.success
-    case .needsComponent: DarwinPalette.warning
     case .fallback: DarwinPalette.info
     case .unsupported: DarwinPalette.danger
     case .unknown: DarwinPalette.textSecondary

@@ -13,8 +13,6 @@ pub enum AppError {
     InvalidGameId(String),
     #[error("invalid PE file: {0}")]
     InvalidPe(String),
-    #[error("DXMT is not installed")]
-    DxmtNotInstalled,
     #[error("Wine prefix is incomplete or corrupted: {0}. Reset the affected prefix and try again")]
     CorruptPrefix(String),
     #[error("Wine prefix was created with {0}, but DarwinWine is now {1}. Reset the affected prefix after a runtime-incompatible update")]
@@ -31,10 +29,6 @@ pub enum AppError {
     InvalidVdf(String),
     #[error("invalid compatibility profile: {0}")]
     InvalidCompatibilityProfile(String),
-    #[error("DXMT package is missing required file: {0}")]
-    DxmtPackageMissing(String),
-    #[error("DXMT release error: {0}")]
-    DxmtRelease(String),
     #[error("path is not a directory: {0}")]
     InvalidDirectory(String),
     #[error("process failed: {0}")]

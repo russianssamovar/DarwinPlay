@@ -1,10 +1,7 @@
 use crate::app_dirs::application_support;
-use crate::compatibility::{
-    BackendOverride, CompatibilityManager, SteamCompatibilityProfile,
-};
+use crate::compatibility::{CompatibilityManager, SteamCompatibilityProfile};
 use crate::error::{AppError, Result};
 use crate::events::{write_json, write_progress, RuntimeEvent};
-use crate::graphics::{GraphicsBackend, GraphicsManager};
 use crate::pe::inspect_pe;
 use crate::prefix::PrefixManager;
 use crate::vdf::{self, VdfValue};
@@ -46,9 +43,6 @@ pub struct SteamStatus {
     pub steam_path: Option<String>,
     pub games_installed: usize,
     pub ui_policy_current: bool,
-    pub ui_backend: Option<GraphicsBackend>,
-    pub ui_dxmt_version: Option<String>,
-    pub ui_backend_verified: bool,
     pub prefix_runtime_compatible: bool,
     pub prefix_runtime_version: Option<String>,
 }
@@ -81,11 +75,8 @@ pub struct SteamUiDiagnostics {
     pub disable_gpu_compositing_observed: bool,
     pub registry_gpu_acceleration_disabled: bool,
     pub vulkan_observed: bool,
-    pub session_backend: Option<GraphicsBackend>,
-    pub session_dxmt_version: Option<String>,
-    pub dxmt_log_path: Option<String>,
-    pub dxmt_log_detected: bool,
-    pub dxmt_activation_state: String,
+    /// The shim is what keeps Steam's windows from rendering black.
+    pub in_process_gpu_observed: bool,
 }
 
 struct SteamExecutable {
@@ -136,13 +127,6 @@ impl SteamManager {
                 .as_ref()
                 .map(|value| value.ui_policy_version == STEAM_UI_POLICY_VERSION)
                 .unwrap_or(false);
-        let session_backend = session.as_ref().map(|value| value.backend);
-        let dxmt_log_root = application_support()?.join("logs/steam-ui/dxmt");
-        let ui_backend_verified = match session_backend {
-            Some(GraphicsBackend::Dxmt) => directory_has_nonempty_file(&dxmt_log_root),
-            Some(GraphicsBackend::WineD3d) | Some(GraphicsBackend::Auto) => true,
-            None => !running,
-        };
         Ok(SteamStatus {
             installed: steam_path.is_some(),
             running,
@@ -150,9 +134,6 @@ impl SteamManager {
             steam_path: steam_path.map(|steam| steam.host_path.display().to_string()),
             games_installed,
             ui_policy_current,
-            ui_backend: session_backend,
-            ui_dxmt_version: session.and_then(|value| value.dxmt_version),
-            ui_backend_verified,
             prefix_runtime_compatible,
             prefix_runtime_version,
         })
@@ -161,7 +142,6 @@ impl SteamManager {
     pub fn install(
         &self,
         runtime: &WineRuntime,
-        graphics: &GraphicsManager,
         installer: Option<&Path>,
         json: bool,
     ) -> Result<SteamStatus> {
@@ -194,12 +174,6 @@ impl SteamManager {
         };
         emit_install_progress(json, "Verifying", "Verifying Steam installer", None, Some(0.46), None, None)?;
         inspect_pe(&installer_path)?;
-        let launch_graphics = graphics.prepare_launch(
-            GraphicsBackend::WineD3d,
-            &[],
-            &prefix,
-            STEAM_PREFIX_ID,
-        )?;
         let installer_directory = installer_path
             .parent()
             .ok_or_else(|| AppError::MissingParent(installer_path.display().to_string()))?;
@@ -222,7 +196,6 @@ impl SteamManager {
             &prefix,
             &windows_installer,
             &installer_arguments,
-            &launch_graphics,
             Duration::from_secs(STEAM_INSTALL_TIMEOUT_SECS),
         );
         let _ = runtime.stop_prefix(&prefix);
@@ -257,15 +230,6 @@ impl SteamManager {
         let combined = format!("{}\n{}", webhelper.as_deref().unwrap_or(""), cef.as_deref().unwrap_or(""));
         let normalized = combined.to_ascii_lowercase();
         let command = command_line.as_deref().unwrap_or("").to_ascii_lowercase();
-        let session = read_steam_ui_session().ok().flatten();
-        let dxmt_log_root = application_support()?.join("logs/steam-ui/dxmt");
-        let dxmt_log_detected = directory_has_nonempty_file(&dxmt_log_root);
-        let dxmt_activation_state = match session.as_ref().map(|value| value.backend) {
-            Some(GraphicsBackend::Dxmt) if dxmt_log_detected => "active",
-            Some(GraphicsBackend::Dxmt) => "requested-not-detected",
-            _ => "not-requested",
-        }
-        .to_string();
         Ok(SteamUiDiagnostics {
             webhelper_log_path: webhelper_path.is_file().then(|| webhelper_path.display().to_string()),
             cef_log_path: cef_path.is_file().then(|| cef_path.display().to_string()),
@@ -274,11 +238,7 @@ impl SteamManager {
             disable_gpu_compositing_observed: command.contains("--disable-gpu-compositing"),
             registry_gpu_acceleration_disabled: steam_gpu_acceleration_disabled_in_registry(&prefix),
             vulkan_observed: normalized.contains("vulkan") || normalized.contains("angle_platform_vulkan"),
-            session_backend: session.as_ref().map(|value| value.backend),
-            session_dxmt_version: session.and_then(|value| value.dxmt_version),
-            dxmt_log_path: dxmt_log_root.is_dir().then(|| dxmt_log_root.display().to_string()),
-            dxmt_log_detected,
-            dxmt_activation_state,
+            in_process_gpu_observed: command.contains("--in-process-gpu"),
         })
     }
 
@@ -325,75 +285,47 @@ impl SteamManager {
         })
     }
 
-    pub fn profile(
-        &self,
-        graphics: &GraphicsManager,
-        app_id: u32,
-        fallback_backend: GraphicsBackend,
-    ) -> Result<SteamCompatibilityProfile> {
+    pub fn profile(&self, app_id: u32) -> Result<SteamCompatibilityProfile> {
         let game = self.game(app_id)?;
-        let dxmt_installed = graphics.dxmt_status()?.installed;
-        self.compatibility.analyze(
-            app_id,
-            &game.name,
-            Path::new(&game.install_path),
-            dxmt_installed,
-            fallback_backend,
-        )
+        self.compatibility
+            .analyze(app_id, &game.name, Path::new(&game.install_path))
     }
 
     pub fn set_profile(
         &self,
-        graphics: &GraphicsManager,
         app_id: u32,
-        backend: BackendOverride,
         executable: Option<&str>,
         launch_arguments: Vec<String>,
-        fallback_backend: GraphicsBackend,
     ) -> Result<SteamCompatibilityProfile> {
-        let current = self.profile(graphics, app_id, fallback_backend)?;
+        let current = self.profile(app_id)?;
         let allowed = current
             .candidates
             .iter()
             .map(|candidate| candidate.relative_path.clone())
             .collect::<Vec<_>>();
         self.compatibility
-            .save(app_id, backend, executable, launch_arguments, &allowed)?;
-        self.profile(graphics, app_id, fallback_backend)
+            .save(app_id, executable, launch_arguments, &allowed)?;
+        self.profile(app_id)
     }
 
-    pub fn reset_profile(
-        &self,
-        graphics: &GraphicsManager,
-        app_id: u32,
-        fallback_backend: GraphicsBackend,
-    ) -> Result<SteamCompatibilityProfile> {
+    pub fn reset_profile(&self, app_id: u32) -> Result<SteamCompatibilityProfile> {
         self.compatibility.reset(app_id)?;
-        self.profile(graphics, app_id, fallback_backend)
+        self.profile(app_id)
     }
 
     pub fn start(
         &self,
         runtime: &WineRuntime,
-        graphics: &GraphicsManager,
-        backend: GraphicsBackend,
         json: bool,
     ) -> Result<()> {
         let prefix = self.prefix_path()?;
         self.prefixes.verify_runtime(runtime, STEAM_PREFIX_ID)?;
         let steam = find_steam_executable(&prefix).ok_or(AppError::SteamNotInstalled)?;
-        let desired_backend = graphics.resolve_steam_ui_backend(backend)?;
         if runtime.is_windows_process_running(&prefix, "steam.exe")? {
             let session = read_steam_ui_session().ok().flatten();
-            let installed_dxmt_version = graphics.dxmt_status()?.version;
             let compatible = session
                 .as_ref()
-                .map(|value| {
-                    value.ui_policy_version == STEAM_UI_POLICY_VERSION
-                        && value.backend == desired_backend
-                        && (desired_backend != GraphicsBackend::Dxmt
-                            || value.dxmt_version == installed_dxmt_version)
-                })
+                .map(|value| value.ui_policy_version == STEAM_UI_POLICY_VERSION)
                 .unwrap_or(false);
             if compatible {
                 emit_steam_state(
@@ -415,73 +347,44 @@ impl SteamManager {
             let _ = runtime.stop_prefix(&prefix);
             thread::sleep(Duration::from_millis(250));
         }
-        let launch_graphics = graphics.prepare_steam_ui(desired_backend, &prefix)?;
-        launch_steam_client(
-            runtime,
-            &prefix,
-            steam.windows_path,
-            &[],
-            json,
-            &launch_graphics,
-            graphics.dxmt_status()?.version,
-        )
+        launch_steam_client(runtime, &prefix, steam.windows_path, &[], json)
     }
 
-    pub fn restart(
-        &self,
-        runtime: &WineRuntime,
-        graphics: &GraphicsManager,
-        backend: GraphicsBackend,
-        json: bool,
-    ) -> Result<()> {
+    pub fn restart(&self, runtime: &WineRuntime, json: bool) -> Result<()> {
         let prefix = self.prefix_path()?;
         self.prefixes.verify_runtime(runtime, STEAM_PREFIX_ID)?;
         let steam = find_steam_executable(&prefix).ok_or(AppError::SteamNotInstalled)?;
-        let desired_backend = graphics.resolve_steam_ui_backend(backend)?;
         runtime.stop_prefix(&prefix)?;
         clear_steam_ui_session()?;
         thread::sleep(Duration::from_millis(350));
-        let launch_graphics = graphics.prepare_steam_ui(desired_backend, &prefix)?;
-        emit_steam_state(json, "restarting_ui", "Restarting Steam UI with the selected graphics backend")?;
-        launch_steam_client(
-            runtime,
-            &prefix,
-            steam.windows_path,
-            &[],
-            json,
-            &launch_graphics,
-            graphics.dxmt_status()?.version,
-        )
+        emit_steam_state(json, "restarting_ui", "Restarting the Steam UI")?;
+        launch_steam_client(runtime, &prefix, steam.windows_path, &[], json)
     }
 
     pub fn launch_game(
         &self,
         runtime: &WineRuntime,
-        graphics: &GraphicsManager,
         app_id: u32,
-        fallback_backend: GraphicsBackend,
         json: bool,
     ) -> Result<()> {
         let prefix = self.prefix_path()?;
         self.prefixes.verify_runtime(runtime, STEAM_PREFIX_ID)?;
         let steam = find_steam_executable(&prefix).ok_or(AppError::SteamNotInstalled)?;
-        let profile = self.profile(graphics, app_id, fallback_backend)?;
-        let (backend, imports, launch_arguments) = self
-            .compatibility
-            .launch_configuration(&profile, fallback_backend);
+        let profile = self.profile(app_id)?;
+        let (_imports, launch_arguments) = self.compatibility.launch_configuration(&profile);
         let mut arguments = vec!["-applaunch".to_string(), app_id.to_string()];
         arguments.extend(launch_arguments);
         let running = runtime.is_windows_process_running(&prefix, "steam.exe")?;
         let session = read_steam_ui_session().ok().flatten();
         let session_matches = session
             .as_ref()
-            .map(|value| value.ui_policy_version == STEAM_UI_POLICY_VERSION && value.backend == backend)
+            .map(|value| value.ui_policy_version == STEAM_UI_POLICY_VERSION)
             .unwrap_or(false);
         if running && session_matches {
             emit_steam_state(
                 json,
                 "reusing_running",
-                "Using the running Steam client because its graphics backend matches the game",
+                "Using the running Steam client",
             )?;
             let _ = runtime.dispatch_windows(&prefix, steam.windows_path, &arguments)?;
             return Ok(());
@@ -489,23 +392,13 @@ impl SteamManager {
         if running {
             emit_steam_state(
                 json,
-                "backend_switch",
-                "Restarting Steam because the game requires a different graphics backend",
+                "ui_policy_restart",
+                "Restarting Steam to apply the current UI policy",
             )?;
             runtime.stop_prefix(&prefix)?;
             thread::sleep(Duration::from_millis(350));
         }
-        let game_runtime_id = format!("steam-{app_id}");
-        let launch_graphics = graphics.prepare_launch(backend, &imports, &prefix, &game_runtime_id)?;
-        launch_steam_client(
-            runtime,
-            &prefix,
-            steam.windows_path,
-            &arguments,
-            json,
-            &launch_graphics,
-            graphics.dxmt_status()?.version,
-        )
+        launch_steam_client(runtime, &prefix, steam.windows_path, &arguments, json)
     }
 
     pub fn stop(&self, runtime: &WineRuntime) -> Result<()> {
@@ -693,18 +586,6 @@ fn read_log_tail(path: &Path, max_bytes: usize) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes[start..]).into_owned())
 }
 
-fn directory_has_nonempty_file(path: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(path) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        entry
-            .metadata()
-            .map(|metadata| metadata.is_file() && metadata.len() > 0)
-            .unwrap_or(false)
-    })
-}
-
 fn latest_webhelper_command_line(text: &str) -> Option<String> {
     text.lines()
         .rev()
@@ -717,7 +598,6 @@ fn emit_steam_state(json: bool, kind: &str, message: &str) -> Result<()> {
             kind,
             stream: None,
             message: Some(message),
-            backend: None,
             pid: None,
             exit_code: None,
             prefix: None,
@@ -801,8 +681,6 @@ fn launch_steam_client(
     executable: &str,
     arguments: &[String],
     json: bool,
-    graphics: &crate::graphics::LaunchGraphics,
-    dxmt_version: Option<String>,
 ) -> Result<()> {
     let client_arguments = steam_cef_safe_arguments(arguments);
     apply_steam_cef_safe_mode(runtime, prefix)?;
@@ -813,22 +691,13 @@ fn launch_steam_client(
             "Installed CEF in-process-GPU shim (Steam had restored its own helper)",
         )?;
     }
-    write_steam_ui_session(graphics.backend, dxmt_version)?;
-    emit_steam_state(
-        json,
-        "ui_graphics",
-        match graphics.backend {
-            GraphicsBackend::Dxmt => "Steam UI graphics: DXMT requested; activation will be verified from runtime logs",
-            GraphicsBackend::WineD3d | GraphicsBackend::Auto => "Steam UI graphics: WineD3D",
-        },
-    )?;
+    write_steam_ui_session()?;
     for attempt in 0..STEAM_RESTART_LIMIT {
         let exit_code = match runtime.launch_windows(
             prefix,
             executable,
             &client_arguments,
             json,
-            graphics,
         ) {
             Ok(exit_code) => exit_code,
             Err(error) => {
@@ -869,24 +738,19 @@ fn apply_steam_cef_safe_mode(runtime: &WineRuntime, prefix: &Path) -> Result<()>
 #[serde(rename_all = "camelCase")]
 struct SteamUiSession {
     ui_policy_version: u32,
-    backend: GraphicsBackend,
-    #[serde(default)]
-    dxmt_version: Option<String>,
 }
 
 fn steam_ui_session_path() -> Result<PathBuf> {
     Ok(application_support()?.join("runtime-state/steam-ui-session.json"))
 }
 
-fn write_steam_ui_session(backend: GraphicsBackend, dxmt_version: Option<String>) -> Result<()> {
+fn write_steam_ui_session() -> Result<()> {
     let path = steam_ui_session_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let value = serde_json::to_vec(&SteamUiSession {
         ui_policy_version: STEAM_UI_POLICY_VERSION,
-        backend,
-        dxmt_version: if backend == GraphicsBackend::Dxmt { dxmt_version } else { None },
     })?;
     let staging = path.with_extension(format!("tmp-{}", std::process::id()));
     fs::write(&staging, value)?;
@@ -1153,13 +1017,10 @@ mod tests {
     }
 
     #[test]
-    fn steam_ui_session_tracks_dxmt_backend() {
+    fn steam_ui_session_records_the_policy_version() {
         let session = SteamUiSession {
             ui_policy_version: STEAM_UI_POLICY_VERSION,
-            backend: GraphicsBackend::Dxmt,
-            dxmt_version: Some("v0.80".to_string()),
         };
-        assert_eq!(session.backend, GraphicsBackend::Dxmt);
-        assert_eq!(session.dxmt_version.as_deref(), Some("v0.80"));
+        assert_eq!(session.ui_policy_version, STEAM_UI_POLICY_VERSION);
     }
 }

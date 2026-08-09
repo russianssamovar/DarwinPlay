@@ -1,19 +1,9 @@
-import AppKit
 import DarwinPlayCore
 import SwiftUI
 
 struct SettingsView: View {
   @Environment(\.dismiss) private var dismiss
   @Bindable var model: AppModel
-  @State private var graphicsBackend: GraphicsBackendPreference
-  @State private var steamUiBackend: GraphicsBackendPreference
-  @State private var dxmtMode: DxmtMode = .builtin
-
-  init(model: AppModel) {
-    self.model = model
-    _graphicsBackend = State(initialValue: model.settings.graphicsBackend)
-    _steamUiBackend = State(initialValue: model.settings.steamUiBackend)
-  }
 
   var body: some View {
     ZStack {
@@ -24,7 +14,6 @@ struct SettingsView: View {
         ScrollView {
           VStack(alignment: .leading, spacing: 24) {
             runtimeSection
-            graphicsSection
           }
           .padding(24)
         }
@@ -42,7 +31,7 @@ struct SettingsView: View {
         Text("Settings")
           .font(.system(size: 22, weight: .semibold))
           .foregroundStyle(DarwinPalette.textPrimary)
-        Text("DarwinWine, Steam, and graphics")
+        Text("DarwinWine and Steam")
           .font(.system(size: 11.5))
           .foregroundStyle(DarwinPalette.textSecondary)
       }
@@ -218,16 +207,10 @@ struct SettingsView: View {
             .foregroundStyle(DarwinPalette.warning)
             .fixedSize(horizontal: false, vertical: true)
           }
-          if model.steamStatus?.installed == true {
-            Text(
-              model.steamUiRestartRequired
-                ? "UI renderer · restart required"
-                : "UI renderer · \(steamUiBackendDescription)"
-            )
-            .font(.system(size: 10.5, weight: .medium))
-            .foregroundStyle(
-              model.steamUiRestartRequired ? DarwinPalette.warning : DarwinPalette.textTertiary
-            )
+          if model.steamUiRestartRequired {
+            Text("Steam UI · restart required")
+              .font(.system(size: 10.5, weight: .medium))
+              .foregroundStyle(DarwinPalette.warning)
           }
           if let path = model.steamStatus?.steamPath {
             Text(path)
@@ -283,185 +266,18 @@ struct SettingsView: View {
     }
   }
 
-  private var graphicsSection: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      SectionHeading(
-        "Graphics", subtitle: "Default translation path; game profiles may override it")
-      SurfaceCard {
-        VStack(alignment: .leading, spacing: 17) {
-          HStack {
-            VStack(alignment: .leading, spacing: 3) {
-              Text("Default game backend")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(DarwinPalette.textPrimary)
-              Text("Automatic prefers DXMT for supported D3D10/11 games.")
-                .font(.system(size: 10.5))
-                .foregroundStyle(DarwinPalette.textTertiary)
-            }
-            Spacer()
-            Picker("Default game backend", selection: $graphicsBackend) {
-              ForEach(GraphicsBackendPreference.allCases) { backend in
-                Text(backend.displayName).tag(backend)
-              }
-            }
-            .labelsHidden()
-            .frame(width: 180)
-          }
-
-          HStack {
-            VStack(alignment: .leading, spacing: 3) {
-              Text("Steam UI backend")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(DarwinPalette.textPrimary)
-              Text("Automatic uses DXMT when installed and WineD3D otherwise.")
-                .font(.system(size: 10.5))
-                .foregroundStyle(DarwinPalette.textTertiary)
-            }
-            Spacer()
-            Picker("Steam UI backend", selection: $steamUiBackend) {
-              ForEach(GraphicsBackendPreference.allCases) { backend in
-                Text(backend.displayName).tag(backend)
-              }
-            }
-            .labelsHidden()
-            .frame(width: 180)
-          }
-
-          Divider().overlay(DarwinPalette.border)
-
-          HStack(alignment: .top, spacing: 13) {
-            Image(systemName: "rectangle.3.group")
-              .font(.system(size: 18, weight: .medium))
-              .foregroundStyle(DarwinPalette.info)
-              .frame(width: 42, height: 42)
-              .background(DarwinPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 11))
-            VStack(alignment: .leading, spacing: 5) {
-              HStack(spacing: 8) {
-                Text("DXMT")
-                  .font(.system(size: 14, weight: .semibold))
-                  .foregroundStyle(DarwinPalette.textPrimary)
-                StatusPill(
-                  model.dxmtStatus?.installed == true ? "INSTALLED" : "OPTIONAL",
-                  tone: model.dxmtStatus?.installed == true ? .success : .neutral
-                )
-              }
-              Text(dxmtDescription)
-                .font(.system(size: 11))
-                .foregroundStyle(DarwinPalette.textSecondary)
-                .textSelection(.enabled)
-            }
-            Spacer()
-            if model.dxmtStatus?.installed == true {
-              Button(role: .destructive) {
-                Task { await model.removeDxmt() }
-              } label: {
-                Text("Remove")
-              }
-              .buttonStyle(SecondaryActionButtonStyle())
-              .disabled(model.isManagingDxmt || model.steamIsRunning)
-            }
-          }
-
-          HStack(spacing: 8) {
-            Button {
-              Task {
-                if model.dxmtStatus?.installed == true {
-                  await model.updateDxmt()
-                } else {
-                  await model.installLatestDxmt()
-                }
-              }
-            } label: {
-              Label(
-                model.isManagingDxmt
-                  ? "Working…"
-                  : (model.dxmtStatus?.installed == true ? "Update DXMT" : "Install Latest DXMT"),
-                systemImage: "arrow.down.circle"
-              )
-            }
-            .buttonStyle(PrimaryActionButtonStyle())
-            .disabled(model.isManagingDxmt || model.steamIsRunning)
-
-            Menu {
-              Picker("Package mode", selection: $dxmtMode) {
-                ForEach(DxmtMode.allCases) { mode in
-                  Text(mode.displayName).tag(mode)
-                }
-              }
-              Button("Install from Folder…") {
-                chooseDxmtPackage()
-              }
-            } label: {
-              Label("Manual", systemImage: "folder")
-            }
-            .buttonStyle(SecondaryActionButtonStyle())
-            .disabled(model.isManagingDxmt || model.steamIsRunning)
-          }
-
-          if model.steamIsRunning {
-            Text("Stop Steam before installing, updating, or removing DXMT.")
-              .font(.system(size: 10.5))
-              .foregroundStyle(DarwinPalette.warning)
-          }
-        }
-      }
-    }
-  }
-
   private var footer: some View {
     HStack(spacing: 8) {
       Spacer()
       Button("Cancel") { dismiss() }
         .buttonStyle(SecondaryActionButtonStyle())
       Button {
-        Task {
-          await model.saveSettings(
-            AppSettings(
-              graphicsBackend: graphicsBackend,
-              steamUiBackend: steamUiBackend
-            )
-          )
-        }
+        Task { await model.saveSettings(AppSettings()) }
       } label: {
         Text("Save")
       }
       .buttonStyle(PrimaryActionButtonStyle())
     }
     .padding(18)
-  }
-
-  private var dxmtDescription: String {
-    guard let status = model.dxmtStatus, status.installed else {
-      return "Direct3D 10/11 → Metal. WineD3D stays available without it."
-    }
-    let mode = status.mode?.displayName ?? "Unknown mode"
-    let version = status.version ?? "custom"
-    let source =
-      status.managed ? "Managed from official release" : (status.sourceName ?? "Manual package")
-    return "\(version) · \(mode) · \(source)"
-  }
-
-  private var steamUiBackendDescription: String {
-    let backend = model.steamStatus?.uiBackend ?? model.effectiveSteamUiBackend
-    if backend == .dxmt, let version = model.steamStatus?.uiDxmtVersion ?? model.dxmtStatus?.version
-    {
-      if model.steamStatus?.running == true, model.steamStatus?.uiBackendVerified == false {
-        return "DXMT \(version) requested · not confirmed"
-      }
-      return "DXMT \(version) → Metal"
-    }
-    return backend.displayName
-  }
-
-  private func chooseDxmtPackage() {
-    let panel = NSOpenPanel()
-    panel.canChooseFiles = false
-    panel.canChooseDirectories = true
-    panel.allowsMultipleSelection = false
-    panel.resolvesAliases = true
-    panel.message = "Select the extracted DXMT package containing x86_64-unix and x86_64-windows"
-    if panel.runModal() == .OK, let url = panel.url {
-      Task { await model.installDxmt(source: url, mode: dxmtMode) }
-    }
   }
 }

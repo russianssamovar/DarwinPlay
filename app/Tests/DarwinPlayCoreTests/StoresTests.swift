@@ -21,10 +21,7 @@ final class StoresTests: XCTestCase {
     defer { try? FileManager.default.removeItem(at: root) }
 
     let store = try SettingsStore(root: root)
-    let expected = AppSettings(
-      graphicsBackend: .dxmt,
-      steamUiBackend: .dxmt
-    )
+    let expected = AppSettings()
     try await store.save(expected)
     let actual = try await store.load()
 
@@ -35,8 +32,7 @@ final class StoresTests: XCTestCase {
     let data = Data(#"{"winePath":"/legacy/wine"}"#.utf8)
     let settings = try JSONDecoder().decode(AppSettings.self, from: data)
 
-    XCTAssertEqual(settings.graphicsBackend, .auto)
-    XCTAssertEqual(settings.steamUiBackend, .auto)
+    XCTAssertEqual(settings, AppSettings())
   }
 
   func testActivityRoundTrip() async throws {
@@ -80,11 +76,10 @@ final class StoresTests: XCTestCase {
   }
 
   func testRuntimeEventDecodes() throws {
-    let data = Data(#"{"kind":"started","backend":"dxmt","pid":42,"prefix":"/tmp/prefix"}"#.utf8)
+    let data = Data(#"{"kind":"started","pid":42,"prefix":"/tmp/prefix"}"#.utf8)
     let event = try JSONDecoder().decode(RuntimeEvent.self, from: data)
 
     XCTAssertEqual(event.kind, "started")
-    XCTAssertEqual(event.backend, "dxmt")
     XCTAssertEqual(event.pid, 42)
     XCTAssertEqual(event.prefix, "/tmp/prefix")
   }
@@ -101,18 +96,5 @@ final class StoresTests: XCTestCase {
     XCTAssertEqual(event.overallProgress, 0.235)
     XCTAssertEqual(event.currentBytes, 100)
     XCTAssertEqual(event.totalBytes, 200)
-  }
-
-  func testDxmtStatusDecodes() throws {
-    let data = Data(
-      #"{"installed":true,"root":"/tmp/dxmt","mode":"builtin","sourceName":"dxmt-v0.80-builtin.tar.gz","hasD3d10core":true,"version":"v0.80","managed":true}"#
-        .utf8)
-    let status = try JSONDecoder().decode(DxmtStatus.self, from: data)
-
-    XCTAssertTrue(status.installed)
-    XCTAssertEqual(status.mode, .builtin)
-    XCTAssertTrue(status.hasD3d10core)
-    XCTAssertEqual(status.version, "v0.80")
-    XCTAssertTrue(status.managed)
   }
 }

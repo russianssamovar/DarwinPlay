@@ -147,7 +147,6 @@ struct SteamGameCard: View {
   private func compatibilityColor(_ level: SteamCompatibilityLevel) -> Color {
     switch level {
     case .promising: DarwinPalette.success
-    case .needsComponent: DarwinPalette.warning
     case .fallback: DarwinPalette.info
     case .unsupported: DarwinPalette.danger
     case .unknown: DarwinPalette.textTertiary

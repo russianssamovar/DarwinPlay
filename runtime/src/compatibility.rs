@@ -1,6 +1,5 @@
 use crate::app_dirs::application_support;
 use crate::error::{AppError, Result};
-use crate::graphics::GraphicsBackend;
 use crate::pe::{PeReport, inspect_pe};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -14,20 +13,10 @@ const MAX_LAUNCH_ARGUMENTS: usize = 64;
 const MAX_LAUNCH_ARGUMENT_LENGTH: usize = 1024;
 const MAX_TOTAL_LAUNCH_ARGUMENT_LENGTH: usize = 8192;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BackendOverride {
-    Inherit,
-    Auto,
-    Dxmt,
-    Wined3d,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CompatibilityLevel {
     Promising,
-    NeedsComponent,
     Fallback,
     Unsupported,
     Unknown,
@@ -53,7 +42,6 @@ pub struct ExecutableCandidate {
     pub imports: Vec<String>,
     pub score: i32,
     pub kind: ExecutableKind,
-    pub recommended_backend: Option<String>,
     pub compatibility: CompatibilityLevel,
     pub reasons: Vec<String>,
 }
@@ -63,16 +51,12 @@ pub struct ExecutableCandidate {
 pub struct SteamCompatibilityProfile {
     pub app_id: u32,
     pub name: String,
-    pub backend_override: BackendOverride,
     pub selected_executable: Option<String>,
     pub launch_arguments: Vec<String>,
     pub recommended_executable: Option<String>,
-    pub recommended_backend: Option<String>,
-    pub effective_backend: String,
     pub compatibility: CompatibilityLevel,
     pub reasons: Vec<String>,
     pub candidates: Vec<ExecutableCandidate>,
-    pub dxmt_installed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +64,6 @@ pub struct SteamCompatibilityProfile {
 struct StoredProfile {
     schema_version: u32,
     app_id: u32,
-    backend_override: BackendOverride,
     selected_executable: Option<String>,
     launch_arguments: Vec<String>,
 }
@@ -90,7 +73,6 @@ impl StoredProfile {
         Self {
             schema_version: PROFILE_SCHEMA_VERSION,
             app_id,
-            backend_override: BackendOverride::Inherit,
             selected_executable: None,
             launch_arguments: Vec::new(),
         }
@@ -116,15 +98,13 @@ impl CompatibilityManager {
         app_id: u32,
         name: &str,
         install_path: &Path,
-        dxmt_installed: bool,
-        fallback_backend: GraphicsBackend,
     ) -> Result<SteamCompatibilityProfile> {
         if !install_path.is_dir() {
             return Err(AppError::InvalidDirectory(install_path.display().to_string()));
         }
 
         let stored = self.load(app_id)?;
-        let mut candidates = scan_candidates(install_path, name, dxmt_installed);
+        let mut candidates = scan_candidates(install_path, name);
         candidates.sort_by_key(|candidate| {
             (
                 Reverse(candidate.score),
@@ -137,14 +117,6 @@ impl CompatibilityManager {
             .and_then(|path| candidates.iter().find(|candidate| candidate.relative_path == path));
         let selected = saved_candidate.or_else(|| candidates.first());
         let recommended = candidates.first();
-        let recommended_backend = selected
-            .and_then(|candidate| candidate.recommended_backend.clone());
-        let effective_backend = effective_backend(
-            stored.backend_override,
-            fallback_backend,
-            selected,
-            dxmt_installed,
-        );
         let compatibility = selected
             .map(|candidate| candidate.compatibility)
             .unwrap_or(CompatibilityLevel::Unknown);
@@ -161,23 +133,18 @@ impl CompatibilityManager {
         Ok(SteamCompatibilityProfile {
             app_id,
             name: name.to_string(),
-            backend_override: stored.backend_override,
             selected_executable: saved_candidate.map(|candidate| candidate.relative_path.clone()),
             launch_arguments: stored.launch_arguments,
             recommended_executable: recommended.map(|candidate| candidate.relative_path.clone()),
-            recommended_backend,
-            effective_backend: backend_name(effective_backend).to_string(),
             compatibility,
             reasons,
             candidates,
-            dxmt_installed,
         })
     }
 
     pub fn save(
         &self,
         app_id: u32,
-        backend_override: BackendOverride,
         selected_executable: Option<&str>,
         launch_arguments: Vec<String>,
         allowed_executables: &[String],
@@ -198,7 +165,6 @@ impl CompatibilityManager {
         let profile = StoredProfile {
             schema_version: PROFILE_SCHEMA_VERSION,
             app_id,
-            backend_override,
             selected_executable,
             launch_arguments,
         };
@@ -216,23 +182,16 @@ impl CompatibilityManager {
     pub fn launch_configuration(
         &self,
         profile: &SteamCompatibilityProfile,
-        fallback_backend: GraphicsBackend,
-    ) -> (GraphicsBackend, Vec<String>, Vec<String>) {
+    ) -> (Vec<String>, Vec<String>) {
         let selected = profile
             .selected_executable
             .as_deref()
             .and_then(|path| profile.candidates.iter().find(|candidate| candidate.relative_path == path))
             .or_else(|| profile.candidates.first());
-        let backend = effective_backend(
-            profile.backend_override,
-            fallback_backend,
-            selected,
-            profile.dxmt_installed,
-        );
         let imports = selected
             .map(|candidate| candidate.imports.clone())
             .unwrap_or_default();
-        (backend, imports, profile.launch_arguments.clone())
+        (imports, profile.launch_arguments.clone())
     }
 
     fn load(&self, app_id: u32) -> Result<StoredProfile> {
@@ -258,13 +217,13 @@ impl CompatibilityManager {
     }
 }
 
-fn scan_candidates(root: &Path, game_name: &str, dxmt_installed: bool) -> Vec<ExecutableCandidate> {
+fn scan_candidates(root: &Path, game_name: &str) -> Vec<ExecutableCandidate> {
     let mut files = Vec::new();
     collect_executables(root, root, 0, &mut files);
     files.truncate(MAX_EXECUTABLES);
     files
         .into_iter()
-        .filter_map(|path| build_candidate(root, &path, game_name, dxmt_installed).ok())
+        .filter_map(|path| build_candidate(root, &path, game_name).ok())
         .collect()
 }
 
@@ -305,7 +264,6 @@ fn build_candidate(
     root: &Path,
     path: &Path,
     game_name: &str,
-    dxmt_installed: bool,
 ) -> Result<ExecutableCandidate> {
     let report = inspect_pe(path)?;
     let relative = path
@@ -318,7 +276,7 @@ fn build_candidate(
         .join("/");
     validate_relative_executable(&relative_path)?;
     let kind = classify(&relative_path);
-    let (recommended_backend, compatibility, mut reasons) = assess(&report, dxmt_installed);
+    let (compatibility, mut reasons) = assess(&report);
     let score = candidate_score(&relative_path, game_name, &report, kind);
     reasons.push(format!("Candidate score: {score}"));
     reasons.push(format!("Candidate type: {}", kind_name(kind)));
@@ -331,16 +289,12 @@ fn build_candidate(
         imports: report.imports,
         score,
         kind,
-        recommended_backend: recommended_backend.map(|backend| backend_name(backend).to_string()),
         compatibility,
         reasons,
     })
 }
 
-fn assess(
-    report: &PeReport,
-    dxmt_installed: bool,
-) -> (Option<GraphicsBackend>, CompatibilityLevel, Vec<String>) {
+fn assess(report: &PeReport) -> (CompatibilityLevel, Vec<String>) {
     let imports = import_set(report);
     let has_d3d12 = imports.contains("d3d12.dll");
     let has_d3d11 = imports.contains("d3d11.dll");
@@ -353,26 +307,19 @@ fn assess(
 
     if has_d3d11 || has_d3d10 {
         let api = if has_d3d11 { "Direct3D 11" } else { "Direct3D 10" };
-        let level = if dxmt_installed {
-            CompatibilityLevel::Promising
-        } else {
-            CompatibilityLevel::NeedsComponent
-        };
-        let component = if dxmt_installed {
-            "DXMT is installed"
-        } else {
-            "DXMT is not installed"
-        };
+        // The runtime translates Direct3D 10/11 to Metal itself; there is no
+        // component for the user to install and nothing to choose between.
         return (
-            Some(GraphicsBackend::Dxmt),
-            level,
-            vec![format!("{api} imports detected"), component.into()],
+            CompatibilityLevel::Promising,
+            vec![
+                format!("{api} imports detected"),
+                "The DarwinWine runtime translates Direct3D 10/11 to Metal".into(),
+            ],
         );
     }
 
     if has_d3d12 {
         return (
-            None,
             CompatibilityLevel::Unsupported,
             vec![
                 "Direct3D 12 imports detected".into(),
@@ -383,36 +330,32 @@ fn assess(
 
     if has_vulkan {
         return (
-            Some(GraphicsBackend::WineD3d),
             CompatibilityLevel::Fallback,
             vec![
                 "Vulkan imports detected".into(),
-                "Vulkan is expected to use Wine's Vulkan path rather than DXMT".into(),
+                "Vulkan runs through Wine's own Vulkan path".into(),
             ],
         );
     }
 
     if has_d3d9 {
         return (
-            Some(GraphicsBackend::WineD3d),
             CompatibilityLevel::Fallback,
             vec![
                 "Direct3D 9 imports detected".into(),
-                "WineD3D is the available Direct3D 9 path in this build".into(),
+                "Direct3D 9 runs through Wine's own Direct3D path".into(),
             ],
         );
     }
 
     if has_opengl {
         return (
-            Some(GraphicsBackend::WineD3d),
             CompatibilityLevel::Fallback,
             vec!["OpenGL imports detected".into()],
         );
     }
 
     (
-        None,
         CompatibilityLevel::Unknown,
         vec!["No supported graphics API was detected from the PE import table".into()],
     )
@@ -530,27 +473,6 @@ fn classify(relative_path: &str) -> ExecutableKind {
     ExecutableKind::Game
 }
 
-fn effective_backend(
-    backend_override: BackendOverride,
-    fallback_backend: GraphicsBackend,
-    selected: Option<&ExecutableCandidate>,
-    dxmt_installed: bool,
-) -> GraphicsBackend {
-    let requested = match backend_override {
-        BackendOverride::Inherit => fallback_backend,
-        BackendOverride::Auto => GraphicsBackend::Auto,
-        BackendOverride::Dxmt => GraphicsBackend::Dxmt,
-        BackendOverride::Wined3d => GraphicsBackend::WineD3d,
-    };
-    if requested != GraphicsBackend::Auto {
-        return requested;
-    }
-    match selected.and_then(|candidate| candidate.recommended_backend.as_deref()) {
-        Some("dxmt") if dxmt_installed => GraphicsBackend::Dxmt,
-        _ => GraphicsBackend::WineD3d,
-    }
-}
-
 fn import_set(report: &PeReport) -> std::collections::BTreeSet<&str> {
     report.imports.iter().map(String::as_str).collect()
 }
@@ -645,14 +567,6 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     }
 }
 
-pub fn backend_name(backend: GraphicsBackend) -> &'static str {
-    match backend {
-        GraphicsBackend::Auto => "auto",
-        GraphicsBackend::WineD3d => "wined3d",
-        GraphicsBackend::Dxmt => "dxmt",
-    }
-}
-
 fn kind_name(kind: ExecutableKind) -> &'static str {
     match kind {
         ExecutableKind::Game => "game",
@@ -684,14 +598,12 @@ mod tests {
         manager
             .save(
                 570,
-                BackendOverride::Dxmt,
                 Some("bin/game.exe"),
                 vec!["-dx11".into()],
                 &["bin/game.exe".into()],
             )
             .unwrap();
         let stored = manager.load(570).unwrap();
-        assert_eq!(stored.backend_override, BackendOverride::Dxmt);
         assert_eq!(stored.selected_executable.as_deref(), Some("bin/game.exe"));
         assert_eq!(stored.launch_arguments, vec!["-dx11"]);
         fs::remove_dir_all(root).unwrap();
@@ -702,7 +614,7 @@ mod tests {
         let root = temp_root("profiles-invalid");
         let manager = CompatibilityManager::with_root(root.clone()).unwrap();
         let error = manager
-            .save(570, BackendOverride::Inherit, Some("other.exe"), vec![], &["game.exe".into()])
+            .save(570, Some("other.exe"), vec![], &["game.exe".into()])
             .unwrap_err();
         assert!(matches!(error, AppError::InvalidCompatibilityProfile(_)));
         fs::remove_dir_all(root).unwrap();
@@ -717,22 +629,18 @@ mod tests {
     }
 
     #[test]
-    fn auto_backend_prefers_dxmt_for_d3d11() {
-        let candidate = ExecutableCandidate {
-            relative_path: "game.exe".into(),
+    fn d3d11_imports_are_promising_without_any_extra_component() {
+        let report = PeReport {
+            path: "game.exe".into(),
             architecture: "x86_64".into(),
             subsystem: "windows-gui".into(),
-            graphics_apis: vec!["Direct3D 11 / DXGI".into()],
+            entry_point: 0,
+            image_base: 0,
             imports: vec!["d3d11.dll".into()],
-            score: 300,
-            kind: ExecutableKind::Game,
-            recommended_backend: Some("dxmt".into()),
-            compatibility: CompatibilityLevel::Promising,
-            reasons: vec![],
+            graphics_apis: vec!["Direct3D 11 / DXGI".into()],
         };
-        assert_eq!(
-            effective_backend(BackendOverride::Auto, GraphicsBackend::Auto, Some(&candidate), true),
-            GraphicsBackend::Dxmt
-        );
+        let (level, reasons) = assess(&report);
+        assert_eq!(level, CompatibilityLevel::Promising);
+        assert!(reasons.iter().any(|reason| reason.contains("Direct3D 11")));
     }
 }

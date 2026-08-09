@@ -6,7 +6,6 @@ import Observation
 enum ConsoleComponent: String, CaseIterable, Identifiable {
   case wine = "Wine"
   case steam = "Steam"
-  case graphics = "Graphics"
   case runtime = "Runtime"
 
   var id: String { rawValue }
@@ -68,7 +67,6 @@ final class AppModel {
   var inspection: PEReport?
   var doctorReport: DoctorReport?
   var runtimeStatus: DarwinWineStatus?
-  var dxmtStatus: DxmtStatus?
   var steamStatus: SteamStatus?
   var steamProfile: SteamCompatibilityProfile?
   var compatibilityProfiles: [UInt32: SteamCompatibilityProfile] = [:]
@@ -82,7 +80,6 @@ final class AppModel {
   var isManagingDarwinWine = false
   var darwinWineProgress: OperationProgressState?
   var steamInstallProgress: OperationProgressState?
-  var isManagingDxmt = false
   var steamSessionRunning = false
   var steamLaunchingAppID: UInt32?
   var runningGameIDs: Set<UUID> = []
@@ -91,26 +88,8 @@ final class AppModel {
     steamSessionRunning || steamStatus?.running == true
   }
 
-  var effectiveSteamUiBackend: GraphicsBackendPreference {
-    switch settings.steamUiBackend {
-    case .auto:
-      dxmtStatus?.installed == true ? .dxmt : .wined3d
-    case .dxmt:
-      .dxmt
-    case .wined3d:
-      .wined3d
-    }
-  }
-
   var steamUiRestartRequired: Bool {
-    guard steamStatus?.running == true else { return false }
-    if steamStatus?.uiPolicyCurrent == false || steamStatus?.uiBackend != effectiveSteamUiBackend {
-      return true
-    }
-    if effectiveSteamUiBackend == .dxmt {
-      return steamStatus?.uiDxmtVersion != dxmtStatus?.version
-    }
-    return false
+    steamStatus?.running == true && steamStatus?.uiPolicyCurrent == false
   }
 
   @ObservationIgnored private var libraryStore: LibraryStore?
@@ -188,7 +167,6 @@ final class AppModel {
         activity = try await activityStore.load()
       }
       await refreshRuntime()
-      await refreshDxmtStatus()
       await refreshSteam()
       if selection == nil {
         selection = .home
@@ -265,7 +243,6 @@ final class AppModel {
     runningGameIDs.insert(game.id)
     recordPlayed(.imported(game))
     appendConsole(.wine, .info, "Launching \(game.name)")
-    let backend = settings.graphicsBackend
 
     let task = Task {
       defer {
@@ -274,9 +251,7 @@ final class AppModel {
       }
 
       do {
-        for try await event in runtimeClient.launch(
-          game: game, backend: backend)
-        {
+        for try await event in runtimeClient.launch(game: game) {
           consume(event, component: .wine)
         }
       } catch {
@@ -450,10 +425,7 @@ final class AppModel {
     compatibilityRequests.insert(game.appId)
     defer { compatibilityRequests.remove(game.appId) }
     do {
-      let profile = try await runtimeClient.steamProfile(
-        appID: game.appId,
-        fallbackBackend: settings.graphicsBackend
-      )
+      let profile = try await runtimeClient.steamProfile(appID: game.appId)
       compatibilityProfiles[game.appId] = profile
       if selectedSteamGame?.appId == game.appId {
         steamProfile = profile
@@ -471,10 +443,7 @@ final class AppModel {
       return
     }
     do {
-      let profile = try await runtimeClient.steamProfile(
-        appID: game.appId,
-        fallbackBackend: settings.graphicsBackend
-      )
+      let profile = try await runtimeClient.steamProfile(appID: game.appId)
       if selectedSteamGame?.appId == game.appId {
         steamProfile = profile
         compatibilityProfiles[game.appId] = profile
@@ -488,7 +457,6 @@ final class AppModel {
   }
 
   func saveSteamProfile(
-    backend: SteamBackendOverride,
     executable: String?,
     launchArguments: [String]
   ) async {
@@ -498,10 +466,8 @@ final class AppModel {
     do {
       let profile = try await runtimeClient.saveSteamProfile(
         appID: game.appId,
-        backend: backend,
         executable: executable,
-        launchArguments: launchArguments,
-        fallbackBackend: settings.graphicsBackend
+        launchArguments: launchArguments
       )
       steamProfile = profile
       compatibilityProfiles[game.appId] = profile
@@ -515,10 +481,7 @@ final class AppModel {
       return
     }
     do {
-      let profile = try await runtimeClient.resetSteamProfile(
-        appID: game.appId,
-        fallbackBackend: settings.graphicsBackend
-      )
+      let profile = try await runtimeClient.resetSteamProfile(appID: game.appId)
       steamProfile = profile
       compatibilityProfiles[game.appId] = profile
     } catch {
@@ -535,11 +498,8 @@ final class AppModel {
       return
     }
     steamLaunchingAppID = nil
-    appendConsole(.steam, .info, "Opening Steam with \(effectiveSteamUiBackend.displayName)")
-    beginSteamSession(
-      runtimeClient.startSteam(
-        backend: settings.steamUiBackend
-      ))
+    appendConsole(.steam, .info, "Opening Steam")
+    beginSteamSession(runtimeClient.startSteam())
   }
 
   func restartSteamUI() {
@@ -547,11 +507,8 @@ final class AppModel {
       return
     }
     steamLaunchingAppID = nil
-    appendConsole(.steam, .info, "Restarting Steam UI with \(effectiveSteamUiBackend.displayName)")
-    beginSteamSession(
-      runtimeClient.restartSteam(
-        backend: settings.steamUiBackend
-      ))
+    appendConsole(.steam, .info, "Restarting Steam UI")
+    beginSteamSession(runtimeClient.restartSteam())
   }
 
   func launchSelectedSteamGame() {
@@ -566,11 +523,7 @@ final class AppModel {
         ? "Launching \(game.name) through the running Steam client"
         : "Launching \(game.name) through Steam"
     )
-    beginSteamSession(
-      runtimeClient.launchSteamGame(
-        appID: game.appId,
-        backend: settings.graphicsBackend
-      ))
+    beginSteamSession(runtimeClient.launchSteamGame(appID: game.appId))
   }
 
   func launch(_ item: PlayableItem) {
@@ -637,91 +590,6 @@ final class AppModel {
 
   func refreshDoctor() async {
     await refreshRuntime()
-  }
-
-  func refreshDxmtStatus() async {
-    guard let runtimeClient else {
-      return
-    }
-
-    do {
-      dxmtStatus = try await runtimeClient.dxmtStatus()
-    } catch {
-      dxmtStatus = nil
-      errorMessage = error.localizedDescription
-    }
-  }
-
-  func installLatestDxmt() async {
-    guard let runtimeClient, !isManagingDxmt else { return }
-    isManagingDxmt = true
-    appendConsole(.graphics, .info, "Downloading the latest managed DXMT release")
-    defer { isManagingDxmt = false }
-    do {
-      dxmtStatus = try await runtimeClient.installLatestDxmt()
-      compatibilityProfiles = [:]
-      let version = dxmtStatus?.version ?? "latest"
-      appendConsole(.graphics, .success, "DXMT \(version) installed")
-      await refreshSteam()
-      await refreshSteamProfile()
-    } catch {
-      appendConsole(.graphics, .error, error.localizedDescription)
-      errorMessage = error.localizedDescription
-    }
-  }
-
-  func updateDxmt() async {
-    guard let runtimeClient, !isManagingDxmt else { return }
-    isManagingDxmt = true
-    appendConsole(.graphics, .info, "Updating DXMT from the official release")
-    defer { isManagingDxmt = false }
-    do {
-      dxmtStatus = try await runtimeClient.updateDxmt()
-      compatibilityProfiles = [:]
-      let version = dxmtStatus?.version ?? "latest"
-      appendConsole(.graphics, .success, "DXMT updated to \(version)")
-      await refreshSteam()
-      await refreshSteamProfile()
-    } catch {
-      appendConsole(.graphics, .error, error.localizedDescription)
-      errorMessage = error.localizedDescription
-    }
-  }
-
-  func installDxmt(source: URL, mode: DxmtMode) async {
-    guard let runtimeClient else {
-      return
-    }
-
-    do {
-      dxmtStatus = try await runtimeClient.installDxmt(source: source, mode: mode)
-      compatibilityProfiles = [:]
-      appendConsole(.graphics, .success, "DXMT installed")
-      await refreshSteam()
-      await refreshSteamProfile()
-    } catch {
-      errorMessage = error.localizedDescription
-    }
-  }
-
-  func removeDxmt() async {
-    guard let runtimeClient, !isManagingDxmt else {
-      return
-    }
-    if steamIsRunning && steamStatus?.uiBackend == .dxmt {
-      errorMessage = "Stop Steam before removing DXMT because the running client is using it."
-      return
-    }
-
-    do {
-      try await runtimeClient.removeDxmt()
-      dxmtStatus = try await runtimeClient.dxmtStatus()
-      compatibilityProfiles = [:]
-      appendConsole(.graphics, .info, "DXMT removed")
-      await refreshSteamProfile()
-    } catch {
-      errorMessage = error.localizedDescription
-    }
   }
 
   func refreshInspection() async {
@@ -826,18 +694,13 @@ final class AppModel {
   private func consume(_ event: RuntimeEvent, component: ConsoleComponent) {
     switch event.kind {
     case "started":
-      if let backend = event.backend {
-        appendConsole(component, .success, "Process started using \(backend)")
-        appendConsole(.graphics, .info, "Active backend: \(backend)")
-      } else if let pid = event.pid {
+      if let pid = event.pid {
         appendConsole(component, .success, "Process started · PID \(pid)")
       }
     case "already_running", "reusing_running":
       appendConsole(component, .info, event.message ?? "Steam is already running")
-    case "restarting_ui", "backend_switch":
+    case "restarting_ui":
       appendConsole(component, .info, event.message ?? "Restarting Steam UI")
-    case "ui_graphics":
-      appendConsole(.graphics, .success, event.message ?? "Steam UI graphics configured")
     case "log":
       let level: ConsoleLevel = event.stream == "stderr" ? .warning : .info
       appendConsole(component, level, event.message ?? "")

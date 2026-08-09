@@ -309,12 +309,6 @@ struct DashboardView: View {
           detail: steamStatusDetail,
           ready: model.runtimeStatus?.ready == true && model.steamStatus?.installed == true
         )
-        statusLine(
-          title: "DXMT",
-          detail: model.dxmtStatus?.installed == true
-            ? (model.dxmtStatus?.version ?? "Ready") : "Optional",
-          ready: model.dxmtStatus?.installed == true
-        )
         Spacer()
       }
     }
