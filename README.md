@@ -60,12 +60,13 @@ Homebrew and Sikarugir are **not DarwinPlay runtime dependencies**.
 ```bash
 brew tap russianssamovar/tap
 brew trust russianssamovar/tap
-brew install --cask --no-quarantine darwinplay
+brew install --cask darwinplay
+xattr -dr com.apple.quarantine /Applications/DarwinPlay.app
 ```
 
-The app is ad-hoc signed, not notarized — `--no-quarantine` keeps Gatekeeper
-from killing it on launch (or clear the flag later with
-`xattr -dr com.apple.quarantine /Applications/DarwinPlay.app`).
+The `xattr` step is required after every install or upgrade: the app is
+ad-hoc signed (not notarized) and Homebrew quarantines casks from third-party
+taps, so without it Gatekeeper kills the binaries on launch.
 
 ## Build DarwinPlay
 
