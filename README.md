@@ -50,10 +50,22 @@ DarwinWine source code is never copied or vendored into this repository.
 - Rosetta 2 (DarwinWine CrossOver runtimes are x86_64)
 - Full Xcode selected with `xcode-select`
 - Rust 1.85 or newer to build DarwinPlay itself
-- A packaged **DarwinWine cx26.3-dp5 or newer** runtime artifact
-- Internet access for Steam and optional managed DXMT installation
+- A **DarwinWine cx26.3-dp5 or newer** runtime (downloaded by the app, or a packaged artifact)
+- Internet access for Steam and runtime downloads
 
 Homebrew and Sikarugir are **not DarwinPlay runtime dependencies**.
+
+## Install with Homebrew
+
+```bash
+brew tap russianssamovar/tap
+brew trust russianssamovar/tap
+brew install --cask --no-quarantine darwinplay
+```
+
+The app is ad-hoc signed, not notarized — `--no-quarantine` keeps Gatekeeper
+from killing it on launch (or clear the flag later with
+`xattr -dr com.apple.quarantine /Applications/DarwinPlay.app`).
 
 ## Build DarwinPlay
 
@@ -73,15 +85,21 @@ sudo xcodebuild -runFirstLaunch
 
 ## Install DarwinWine
 
-Build/package DarwinWine in the separate DarwinWine repository. The artifact must contain a schema-2 `runtime.json` and the declared `wine` / `wineserver` entrypoints.
+From the UI, use **Download & Install** — the app fetches the newest published
+DarwinWine release from GitHub, verifies its checksum and installs it. The same
+operation is available through the runtime CLI:
 
-From the UI, use **Install Runtime…** and select the generated `.tar.zst` artifact.
+```bash
+cargo run --manifest-path runtime/Cargo.toml -- runtime install-latest
+```
 
-The same operation is available through the runtime CLI:
+To install a locally built artifact instead (it must contain a schema-2
+`runtime.json` and the declared `wine` / `wineserver` entrypoints), use
+**From File…** in Settings, or:
 
 ```bash
 cargo run --manifest-path runtime/Cargo.toml -- \
-  runtime install --archive /path/to/DarwinWine-cx26.3-dp5-macos-x86_64.tar.zst --json
+  runtime install --archive /path/to/DarwinWine-cx26.3-dp8-macos-x86_64.tar.zst --json
 ```
 
 Inspect status:
