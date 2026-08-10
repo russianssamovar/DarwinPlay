@@ -137,6 +137,9 @@ struct SettingsView: View {
               .buttonStyle(PrimaryActionButtonStyle())
           }
 
+          darwinWineInstallFromFileButton
+            .buttonStyle(SecondaryActionButtonStyle())
+
           if installed {
             Button(role: .destructive) {
               Task { await model.removeDarwinWine() }
@@ -154,15 +157,27 @@ struct SettingsView: View {
 
   private func darwinWineInstallButton(installed: Bool) -> some View {
     Button {
-      Task { await model.installDarwinWine() }
+      Task { await model.installLatestDarwinWine() }
     } label: {
       Text(
         model.isManagingDarwinWine
-          ? "Installing…" : (installed ? "Install Update…" : "Install Runtime…"))
+          ? "Installing…" : (installed ? "Update to Latest" : "Download & Install"))
     }
     .disabled(
       model.isManagingDarwinWine || model.steamIsRunning || !model.runningGameIDs.isEmpty
     )
+  }
+
+  private var darwinWineInstallFromFileButton: some View {
+    Button {
+      Task { await model.installDarwinWine() }
+    } label: {
+      Text("From File…")
+    }
+    .disabled(
+      model.isManagingDarwinWine || model.steamIsRunning || !model.runningGameIDs.isEmpty
+    )
+    .help("Install a DarwinWine runtime artifact (.tar.zst) you downloaded yourself")
   }
 
   private var steamRuntimeCard: some View {

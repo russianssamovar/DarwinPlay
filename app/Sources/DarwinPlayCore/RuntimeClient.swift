@@ -53,6 +53,10 @@ public struct RuntimeClient: Sendable {
     stream(arguments: ["runtime", "install", "--archive", archive.path, "--json"])
   }
 
+  public func installLatestDarwinWine() -> AsyncThrowingStream<RuntimeEvent, Error> {
+    stream(arguments: ["runtime", "install-latest", "--json"])
+  }
+
   public func removeDarwinWine() async throws {
     _ = try await run(arguments: ["runtime", "remove", "--json"])
   }

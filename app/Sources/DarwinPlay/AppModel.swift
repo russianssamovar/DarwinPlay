@@ -291,6 +291,17 @@ final class AppModel {
     }
   }
 
+  func installLatestDarwinWine() async {
+    guard let runtimeClient, !isManagingDarwinWine, !steamIsRunning, runningGameIDs.isEmpty else {
+      return
+    }
+
+    await runDarwinWineInstall(
+      events: runtimeClient.installLatestDarwinWine(),
+      consoleMessage: "Downloading the latest DarwinWine release"
+    )
+  }
+
   func installDarwinWine() async {
     guard let runtimeClient, !isManagingDarwinWine, !steamIsRunning, runningGameIDs.isEmpty else {
       return
@@ -304,6 +315,16 @@ final class AppModel {
     panel.message = "Select a DarwinWine runtime artifact (.tar.zst)"
     guard panel.runModal() == .OK, let archive = panel.url else { return }
 
+    await runDarwinWineInstall(
+      events: runtimeClient.installDarwinWine(archive: archive),
+      consoleMessage: "Installing DarwinWine from \(archive.lastPathComponent)"
+    )
+  }
+
+  private func runDarwinWineInstall(
+    events: AsyncThrowingStream<RuntimeEvent, Error>,
+    consoleMessage: String
+  ) async {
     isManagingDarwinWine = true
     darwinWineProgress = OperationProgressState(
       phase: "Preparing",
@@ -313,14 +334,14 @@ final class AppModel {
       currentBytes: nil,
       totalBytes: nil
     )
-    appendConsole(.runtime, .info, "Installing DarwinWine from \(archive.lastPathComponent)")
+    appendConsole(.runtime, .info, consoleMessage)
     defer {
       isManagingDarwinWine = false
       darwinWineProgress = nil
     }
 
     do {
-      for try await event in runtimeClient.installDarwinWine(archive: archive) {
+      for try await event in events {
         updateProgress(from: event, target: &darwinWineProgress)
         consume(event, component: .runtime)
       }

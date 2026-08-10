@@ -53,7 +53,7 @@ struct DashboardView: View {
           if model.runtimeStatus?.ready == true {
             model.isShowingSettings = true
           } else {
-            Task { await model.installDarwinWine() }
+            Task { await model.installLatestDarwinWine() }
           }
         }
 
@@ -100,7 +100,7 @@ struct DashboardView: View {
     if model.runtimeStatus?.ready == true { return "Manage in Settings" }
     if model.isManagingDarwinWine { return "Installing Runtime…" }
     if model.runtimeStatus?.installed == true { return "Reinstall Runtime" }
-    return "Install Runtime"
+    return "Download & Install"
   }
 
   private func setupCard(
@@ -208,7 +208,7 @@ struct DashboardView: View {
         Spacer(minLength: 18)
 
         Button {
-          Task { await model.installDarwinWine() }
+          Task { await model.installLatestDarwinWine() }
         } label: {
           Text(model.isManagingDarwinWine ? "Installing…" : "Reinstall Runtime")
         }
