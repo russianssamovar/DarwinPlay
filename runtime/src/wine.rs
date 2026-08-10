@@ -749,9 +749,25 @@ impl WineRuntime {
         arguments: &[String],
         json: bool,
     ) -> Result<i32> {
+        self.launch_windows_in(prefix, executable, arguments, json, None)
+    }
+
+    /// Games routinely resolve their data relative to the executable, so a game
+    /// started outside its own directory fails to find its assets.
+    pub fn launch_windows_in(
+        &self,
+        prefix: &Path,
+        executable: &str,
+        arguments: &[String],
+        json: bool,
+        working_directory: Option<&Path>,
+    ) -> Result<i32> {
         validate_windows_executable(executable)?;
         let mut command = Command::new(&self.wine);
         command.arg(executable).args(arguments);
+        if let Some(directory) = working_directory {
+            command.current_dir(directory);
+        }
         configure_command(&mut command, prefix, &self.wine);
         self.stream_command(command, prefix, json)
     }

@@ -505,7 +505,7 @@ fn is_executable_path(path: &Path) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("exe"))
 }
 
-fn validate_relative_executable(value: &str) -> Result<()> {
+pub(crate) fn validate_relative_executable(value: &str) -> Result<()> {
     if value.is_empty()
         || value.starts_with('/')
         || value.starts_with('\\')

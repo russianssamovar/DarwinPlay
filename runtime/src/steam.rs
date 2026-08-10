@@ -1,5 +1,5 @@
 use crate::app_dirs::application_support;
-use crate::compatibility::{CompatibilityManager, SteamCompatibilityProfile};
+use crate::compatibility::{validate_relative_executable, CompatibilityManager, SteamCompatibilityProfile};
 use crate::error::{AppError, Result};
 use crate::events::{write_json, write_progress, RuntimeEvent};
 use crate::pe::inspect_pe;
@@ -372,6 +372,16 @@ impl SteamManager {
         let steam = find_steam_executable(&prefix).ok_or(AppError::SteamNotInstalled)?;
         let profile = self.profile(app_id)?;
         let (_imports, launch_arguments) = self.compatibility.launch_configuration(&profile);
+
+        // Some titles cannot be started through Steam at all: Steam resolves the
+        // executable from its own app info, and when that record carries no launch
+        // block it tries to start an empty path and fails. The profile's selected
+        // executable is the escape hatch -- run the binary ourselves, with Steam
+        // already up so the client-side DRM is satisfied.
+        if let Some(relative) = profile.selected_executable.as_deref() {
+            return self.launch_selected_executable(runtime, &prefix, app_id, relative, &launch_arguments, json);
+        }
+
         let mut arguments = vec!["-applaunch".to_string(), app_id.to_string()];
         arguments.extend(launch_arguments);
         let running = runtime.is_windows_process_running(&prefix, "steam.exe")?;
@@ -399,6 +409,40 @@ impl SteamManager {
             thread::sleep(Duration::from_millis(350));
         }
         launch_steam_client(runtime, &prefix, steam.windows_path, &arguments, json)
+    }
+
+    fn launch_selected_executable(
+        &self,
+        runtime: &WineRuntime,
+        prefix: &Path,
+        app_id: u32,
+        relative: &str,
+        launch_arguments: &[String],
+        json: bool,
+    ) -> Result<()> {
+        let game = self.game(app_id)?;
+        let host = resolve_game_executable(Path::new(&game.install_path), relative)?;
+        let windows_path = host_path_to_windows(prefix, &host)
+            .ok_or_else(|| AppError::InvalidFile(host.display().to_string()))?;
+        let working_directory = host
+            .parent()
+            .ok_or_else(|| AppError::MissingParent(host.display().to_string()))?;
+
+        if !runtime.is_windows_process_running(prefix, "steam.exe")? {
+            return Err(AppError::ProcessFailed(format!(
+                "Steam must be running before launching {relative} directly; \
+                 start Steam first, then launch the game"
+            )));
+        }
+
+        emit_steam_state(
+            json,
+            "launching_executable",
+            &format!("Launching {relative} directly"),
+        )?;
+        runtime
+            .launch_windows_in(prefix, &windows_path, launch_arguments, json, Some(working_directory))
+            .map(|_| ())
     }
 
     pub fn stop(&self, runtime: &WineRuntime) -> Result<()> {
@@ -860,6 +904,58 @@ fn optional_u64(object: &BTreeMap<String, VdfValue>, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Resolve a profile-selected executable against the game's install directory,
+/// rejecting anything that escapes it.
+fn resolve_game_executable(install_path: &Path, relative: &str) -> Result<PathBuf> {
+    validate_relative_executable(relative)?;
+    let mut host = install_path.to_path_buf();
+    for component in relative.split('/').filter(|value| !value.is_empty()) {
+        host.push(component);
+    }
+    let host = normalize_host_path(host);
+    if !host.starts_with(normalize_host_path(install_path.to_path_buf())) {
+        return Err(AppError::InvalidFile(host.display().to_string()));
+    }
+    if !host.is_file() {
+        return Err(AppError::InvalidFile(host.display().to_string()));
+    }
+    Ok(host)
+}
+
+/// Inverse of windows_path_to_host: express a host path inside the prefix as the
+/// DOS path Wine will accept.
+fn host_path_to_windows(prefix: &Path, host: &Path) -> Option<String> {
+    let host = normalize_host_path(host.to_path_buf());
+    let dosdevices = prefix.join("dosdevices");
+    let mut entries: Vec<_> = fs::read_dir(&dosdevices).ok()?.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Only drive letters; the ::$ device links are not path roots.
+        if name.len() != 2 || !name.ends_with(':') || !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        let target = fs::read_link(entry.path()).ok()?;
+        let base = if target.is_absolute() {
+            target
+        } else {
+            dosdevices.join(target)
+        };
+        let base = normalize_host_path(base);
+        if let Ok(rest) = host.strip_prefix(&base) {
+            let drive = name.chars().next()?.to_ascii_uppercase();
+            let tail = rest
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("\\");
+            return Some(format!("{drive}:\\{tail}"));
+        }
+    }
+    None
+}
+
 fn windows_path_to_host(prefix: &Path, value: &str) -> Option<PathBuf> {
     let normalized = value.replace('/', "\\");
     let bytes = normalized.as_bytes();
@@ -902,6 +998,39 @@ fn normalize_host_path(path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn expresses_a_host_path_as_a_dos_path() {
+        let root = std::env::temp_dir().join(format!("darwinplay-hostpath-{}", std::process::id()));
+        let prefix = root.join("prefix");
+        fs::create_dir_all(prefix.join("dosdevices")).unwrap();
+        fs::create_dir_all(prefix.join("drive_c/games/witcher/bin")).unwrap();
+        symlink("../drive_c", prefix.join("dosdevices/c:")).unwrap();
+
+        let host = prefix.join("drive_c/games/witcher/bin/game.exe");
+        assert_eq!(
+            host_path_to_windows(&prefix, &host).as_deref(),
+            Some("C:\\games\\witcher\\bin\\game.exe")
+        );
+        // A path outside every mapped drive has no DOS equivalent.
+        assert!(host_path_to_windows(&prefix, Path::new("/etc/hosts")).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_executable_must_stay_inside_the_installation() {
+        let root = std::env::temp_dir().join(format!("darwinplay-selected-{}", std::process::id()));
+        let install = root.join("The Witcher 3");
+        fs::create_dir_all(install.join("bin/x64")).unwrap();
+        fs::write(install.join("bin/x64/witcher3.exe"), b"MZ").unwrap();
+        fs::write(root.join("outside.exe"), b"MZ").unwrap();
+
+        assert!(resolve_game_executable(&install, "bin/x64/witcher3.exe").is_ok());
+        // Escaping the install directory and naming a missing file both fail.
+        assert!(resolve_game_executable(&install, "../outside.exe").is_err());
+        assert!(resolve_game_executable(&install, "bin/x64/missing.exe").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn maps_windows_drive_to_prefix() {
