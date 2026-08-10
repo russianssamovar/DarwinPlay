@@ -144,6 +144,7 @@ pub fn install_darwinwine(archive: &Path, json: bool) -> Result<DarwinWineStatus
     let support = application_support()?;
     let runtimes = support.join("runtime");
     fs::create_dir_all(&runtimes)?;
+    sweep_stale_install_dirs(&runtimes);
     let staging = runtimes.join(format!(".darwinwine-install-{}", std::process::id()));
     remove_path_if_exists(&staging)?;
     fs::create_dir_all(&staging)?;
@@ -183,8 +184,11 @@ pub fn install_darwinwine(archive: &Path, json: bool) -> Result<DarwinWineStatus
         }
         return Err(error.into());
     }
-    remove_path_if_exists(&backup)?;
-    remove_path_if_exists(&staging)?;
+    // The runtime is active from here on; cleanup problems must not be
+    // reported as an installation failure. Anything left behind is swept by
+    // the next install.
+    let _ = remove_path_if_exists(&backup);
+    let _ = remove_path_if_exists(&staging);
 
     let status = runtime_status();
     if !status.ready {
@@ -306,8 +310,45 @@ fn find_runtime_root(root: &Path, depth: usize) -> Option<PathBuf> {
     None
 }
 
+/// Opens the archive for reading, decompressing zstd in-process. The system
+/// bsdtar handles `.tar.zst` by spawning an external `zstd` from PATH, which
+/// does not exist in a GUI app's environment (and may not be installed at
+/// all), so tar must only ever see a plain tar stream on stdin.
+fn open_archive_stream(archive: &Path) -> Result<Box<dyn std::io::Read + Send>> {
+    let file = fs::File::open(archive)?;
+    if archive.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zst")) {
+        let decoder = zstd::stream::read::Decoder::new(file)
+            .map_err(|error| AppError::Runtime(format!("failed to open zstd archive: {error}")))?;
+        Ok(Box::new(decoder))
+    } else {
+        Ok(Box::new(file))
+    }
+}
+
+/// Spawns a thread feeding the (decompressed) archive into a child's stdin.
+/// A broken pipe is expected when tar stops reading early; real read errors
+/// surface through tar's own failure.
+fn feed_archive(
+    mut reader: Box<dyn std::io::Read + Send>,
+    mut stdin: std::process::ChildStdin,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let _ = std::io::copy(&mut reader, &mut stdin);
+    })
+}
+
 fn validate_archive_paths(archive: &Path) -> Result<HashSet<String>> {
-    let output = Command::new("/usr/bin/tar").arg("-tf").arg(archive).output()?;
+    let mut child = Command::new("/usr/bin/tar")
+        .arg("-tf").arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdin = child.stdin.take()
+        .ok_or_else(|| AppError::Runtime("failed to open tar stdin".into()))?;
+    let feeder = feed_archive(open_archive_stream(archive)?, stdin);
+    let output = child.wait_with_output()?;
+    let _ = feeder.join();
     if !output.status.success() {
         return Err(command_failure("tar -tf", &output));
     }
@@ -336,13 +377,16 @@ fn extract_archive(
     enum TarLine { Stdout(String), Stderr(String) }
 
     let mut child = Command::new("/usr/bin/tar")
-        .arg("-xvf").arg(archive)
+        .arg("-xvf").arg("-")
         .arg("-C").arg(destination)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
+    let archive_stdin = child.stdin.take()
+        .ok_or_else(|| AppError::Runtime("failed to open tar stdin".into()))?;
+    let _feeder = feed_archive(open_archive_stream(archive)?, archive_stdin);
     let stdout = child.stdout.take().ok_or_else(|| AppError::Runtime("failed to capture tar stdout".into()))?;
     let stderr = child.stderr.take().ok_or_else(|| AppError::Runtime("failed to capture tar stderr".into()))?;
     let (tx, rx) = mpsc::channel();
@@ -618,8 +662,50 @@ fn remove_legacy_managed_wine_state(support: &Path) -> Result<()> {
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {
     if !path.exists() { return Ok(()); }
-    if path.is_dir() { fs::remove_dir_all(path)?; } else { fs::remove_file(path)?; }
-    Ok(())
+    if !path.is_dir() {
+        fs::remove_file(path)?;
+        return Ok(());
+    }
+
+    // Rename the tree away first so the original name frees up atomically,
+    // then delete. Finder and Spotlight materialize .DS_Store entries inside
+    // trees that are being deleted, which makes a plain remove_dir_all fail
+    // with ENOTEMPTY (os error 66) on large runtimes.
+    static DOOM_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let doomed = path.with_file_name(format!(
+        ".doomed-{}-{}",
+        std::process::id(),
+        DOOM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let victim = if fs::rename(path, &doomed).is_ok() { doomed } else { path.to_path_buf() };
+
+    let mut last_error = None;
+    for attempt in 0..3 {
+        if attempt > 0 { thread::sleep(Duration::from_millis(150)); }
+        match fs::remove_dir_all(&victim) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("remove_dir_all retried without recording an error").into())
+}
+
+/// Best-effort removal of leftovers from crashed or interrupted installs:
+/// stale staging trees, an orphaned backup, and rename-parked `.doomed-*`
+/// trees whose deletion lost a race with Finder.
+fn sweep_stale_install_dirs(runtimes: &Path) {
+    let Ok(entries) = fs::read_dir(runtimes) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(".darwinwine-install-")
+            || name.starts_with(".doomed-")
+            || name == ".darwinwine-backup"
+        {
+            let _ = remove_path_if_exists(&entry.path());
+        }
+    }
 }
 impl WineRuntime {
     pub fn discover() -> Result<Self> {

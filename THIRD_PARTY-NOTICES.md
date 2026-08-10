@@ -8,9 +8,9 @@ DarwinPlay supports only packaged DarwinWine runtime artifacts produced by the s
 
 The current minimum supported runtime is DarwinWine cx26.3-dp5 for x86_64 macOS.
 
-## DXMT
+## zstd
 
-DXMT may be downloaded from the official 3Shain/dxmt GitHub releases when the user installs the managed graphics component. DXMT remains separate from the DarwinWine runtime.
+The `darwinplay-runtime` binary statically links libzstd (via the Rust `zstd` crate) to unpack DarwinWine runtime archives. Zstandard is copyright Meta Platforms, Inc. and affiliates, licensed under the BSD 3-Clause License (https://github.com/facebook/zstd/blob/dev/LICENSE).
 
 ## Steam
 
