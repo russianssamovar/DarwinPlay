@@ -125,6 +125,18 @@ public struct SteamExecutableCandidate: Codable, Identifiable, Hashable, Sendabl
   public var id: String { relativePath }
 }
 
+public enum AntiCheat: String, Codable, Hashable, Sendable {
+  case easyAntiCheat = "easy-anti-cheat"
+  case battlEye = "battl-eye"
+}
+
+public struct AntiCheatReport: Codable, Equatable, Sendable {
+  public let detected: [AntiCheat]
+  public let protonModulePresent: Bool
+  public let markerPaths: [String]
+  public let advisory: String?
+}
+
 public struct SteamCompatibilityProfile: Codable, Equatable, Sendable {
   public let appId: UInt32
   public let name: String
@@ -133,7 +145,21 @@ public struct SteamCompatibilityProfile: Codable, Equatable, Sendable {
   public let recommendedExecutable: String?
   public let compatibility: SteamCompatibilityLevel
   public let reasons: [String]
+  public let antiCheat: AntiCheatReport?
   public let candidates: [SteamExecutableCandidate]
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    appId = try container.decode(UInt32.self, forKey: .appId)
+    name = try container.decode(String.self, forKey: .name)
+    selectedExecutable = try container.decodeIfPresent(String.self, forKey: .selectedExecutable)
+    launchArguments = try container.decodeIfPresent([String].self, forKey: .launchArguments) ?? []
+    recommendedExecutable = try container.decodeIfPresent(String.self, forKey: .recommendedExecutable)
+    compatibility = try container.decode(SteamCompatibilityLevel.self, forKey: .compatibility)
+    reasons = try container.decodeIfPresent([String].self, forKey: .reasons) ?? []
+    antiCheat = try container.decodeIfPresent(AntiCheatReport.self, forKey: .antiCheat)
+    candidates = try container.decodeIfPresent([SteamExecutableCandidate].self, forKey: .candidates) ?? []
+  }
 }
 
 public enum LibrarySelection: Hashable, Sendable {

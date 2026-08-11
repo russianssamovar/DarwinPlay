@@ -12,6 +12,7 @@ const MAX_SCAN_DEPTH: usize = 8;
 const MAX_LAUNCH_ARGUMENTS: usize = 64;
 const MAX_LAUNCH_ARGUMENT_LENGTH: usize = 1024;
 const MAX_TOTAL_LAUNCH_ARGUMENT_LENGTH: usize = 8192;
+const MAX_ANTI_CHEAT_MARKERS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -20,6 +21,33 @@ pub enum CompatibilityLevel {
     Fallback,
     Unsupported,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AntiCheat {
+    EasyAntiCheat,
+    BattlEye,
+}
+
+impl AntiCheat {
+    fn label(self) -> &'static str {
+        match self {
+            AntiCheat::EasyAntiCheat => "Easy Anti-Cheat",
+            AntiCheat::BattlEye => "BattlEye",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntiCheatReport {
+    pub detected: Vec<AntiCheat>,
+    /// A native Linux/Proton module (…_x64.so) ships, so the developer enabled
+    /// Proton anti-cheat: multiplayer works on Deck/Linux but still not macOS.
+    pub proton_module_present: bool,
+    pub marker_paths: Vec<String>,
+    pub advisory: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -56,6 +84,7 @@ pub struct SteamCompatibilityProfile {
     pub recommended_executable: Option<String>,
     pub compatibility: CompatibilityLevel,
     pub reasons: Vec<String>,
+    pub anti_cheat: AntiCheatReport,
     pub candidates: Vec<ExecutableCandidate>,
 }
 
@@ -130,6 +159,11 @@ impl CompatibilityManager {
             reasons.push(format!("Saved analysis target is no longer installed: {path}"));
         }
 
+        let anti_cheat = detect_anti_cheat(install_path);
+        if let Some(advisory) = &anti_cheat.advisory {
+            reasons.push(advisory.clone());
+        }
+
         Ok(SteamCompatibilityProfile {
             app_id,
             name: name.to_string(),
@@ -138,6 +172,7 @@ impl CompatibilityManager {
             recommended_executable: recommended.map(|candidate| candidate.relative_path.clone()),
             compatibility,
             reasons,
+            anti_cheat,
             candidates,
         })
     }
@@ -215,6 +250,133 @@ impl CompatibilityManager {
     fn path(&self, app_id: u32) -> PathBuf {
         self.root.join(format!("{app_id}.json"))
     }
+}
+
+fn detect_anti_cheat(root: &Path) -> AntiCheatReport {
+    let mut detected = Vec::new();
+    let mut marker_paths = Vec::new();
+    let mut proton_module_present = false;
+    scan_anti_cheat(root, root, 0, &mut detected, &mut marker_paths, &mut proton_module_present);
+    detected.sort();
+    detected.dedup();
+    let advisory = anti_cheat_advisory(&detected, proton_module_present);
+    AntiCheatReport { detected, proton_module_present, marker_paths, advisory }
+}
+
+fn scan_anti_cheat(
+    root: &Path,
+    directory: &Path,
+    depth: usize,
+    detected: &mut Vec<AntiCheat>,
+    marker_paths: &mut Vec<String>,
+    proton_module_present: &mut bool,
+) {
+    let both_found = detected.contains(&AntiCheat::EasyAntiCheat)
+        && detected.contains(&AntiCheat::BattlEye);
+    if depth > MAX_SCAN_DEPTH || (both_found && *proton_module_present) {
+        return;
+    }
+    let Ok(read_dir) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in read_dir.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        let lower = entry.file_name().to_string_lossy().to_ascii_lowercase();
+
+        if file_type.is_dir() {
+            match lower.as_str() {
+                "easyanticheat" | "easyanticheat_eos" => {
+                    record_anti_cheat_marker(&path, root, AntiCheat::EasyAntiCheat, detected, marker_paths)
+                }
+                "battleye" => {
+                    record_anti_cheat_marker(&path, root, AntiCheat::BattlEye, detected, marker_paths)
+                }
+                _ => {}
+            }
+            scan_anti_cheat(root, &path, depth + 1, detected, marker_paths, proton_module_present);
+            continue;
+        }
+
+        if let Some(kind) = anti_cheat_file_marker(&lower) {
+            record_anti_cheat_marker(&path, root, kind, detected, marker_paths);
+        }
+        if lower == "easyanticheat_x64.so" || lower == "easyanticheat.so" {
+            *proton_module_present = true;
+        }
+    }
+}
+
+fn anti_cheat_file_marker(lower_name: &str) -> Option<AntiCheat> {
+    const EAC: &[&str] = &[
+        "easyanticheat_x64.dll",
+        "easyanticheat.dll",
+        "easyanticheat_x64.so",
+        "eaclauncher.exe",
+        "easyanticheat_setup.exe",
+        "start_protected_game.exe",
+    ];
+    const BE: &[&str] = &[
+        "beservice.exe",
+        "beservice_x64.exe",
+        "belauncher.exe",
+        "battleye_x64.dll",
+        "beclient_x64.dll",
+        "beclient.dll",
+    ];
+    if EAC.contains(&lower_name) {
+        return Some(AntiCheat::EasyAntiCheat);
+    }
+    if BE.contains(&lower_name) {
+        return Some(AntiCheat::BattlEye);
+    }
+    None
+}
+
+fn record_anti_cheat_marker(
+    path: &Path,
+    root: &Path,
+    kind: AntiCheat,
+    detected: &mut Vec<AntiCheat>,
+    marker_paths: &mut Vec<String>,
+) {
+    if !detected.contains(&kind) {
+        detected.push(kind);
+    }
+    if marker_paths.len() < MAX_ANTI_CHEAT_MARKERS
+        && let Ok(relative) = path.strip_prefix(root)
+    {
+        marker_paths.push(relative.to_string_lossy().replace('\\', "/"));
+    }
+}
+
+fn anti_cheat_advisory(detected: &[AntiCheat], proton_module_present: bool) -> Option<String> {
+    if detected.is_empty() {
+        return None;
+    }
+    let names = detected
+        .iter()
+        .map(|anti_cheat| anti_cheat.label())
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let mut text = format!(
+        "{names} was detected. Kernel-level anti-cheat has no macOS runtime, so \
+         online or protected modes will not launch under DarwinWine. Single-player \
+         usually still runs by selecting the game executable directly."
+    );
+    if proton_module_present {
+        text.push_str(
+            " A Linux/Proton anti-cheat module ships with this game, so its multiplayer \
+             works on Steam Deck and Linux, but that module is an ELF binary with no \
+             macOS-native equivalent.",
+        );
+    }
+    Some(text)
 }
 
 fn scan_candidates(root: &Path, game_name: &str) -> Vec<ExecutableCandidate> {
@@ -463,11 +625,15 @@ fn classify(relative_path: &str) -> ExecutableKind {
             "configtool",
             "configurator",
             "setup",
+            "beservice",
         ],
     ) {
         return ExecutableKind::Tool;
     }
-    if contains_any(&file_name, &["launcher", "bootstrap", "start_protected_game"]) {
+    if contains_any(
+        &file_name,
+        &["launcher", "bootstrap", "start_protected_game", "eaclauncher", "belauncher"],
+    ) {
         return ExecutableKind::Launcher;
     }
     ExecutableKind::Game
@@ -626,6 +792,47 @@ mod tests {
             classify("_CommonRedist/vcredist/2022/vc_redist.x64.exe"),
             ExecutableKind::Redistributable
         );
+    }
+
+    #[test]
+    fn detects_easy_anti_cheat_and_notes_proton_module() {
+        let root = temp_root("eac");
+        let eac = root.join("EasyAntiCheat");
+        fs::create_dir_all(&eac).unwrap();
+        fs::write(eac.join("EasyAntiCheat_x64.so"), b"\x7fELF").unwrap();
+        let report = detect_anti_cheat(&root);
+        assert_eq!(report.detected, vec![AntiCheat::EasyAntiCheat]);
+        assert!(report.proton_module_present);
+        assert!(report.advisory.as_deref().unwrap().contains("macOS"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detects_battleye_service() {
+        let root = temp_root("battleye");
+        fs::write(root.join("BEService_x64.exe"), b"MZ").unwrap();
+        let report = detect_anti_cheat(&root);
+        assert_eq!(report.detected, vec![AntiCheat::BattlEye]);
+        assert!(!report.proton_module_present);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_install_reports_no_anti_cheat() {
+        let root = temp_root("clean");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/game.exe"), b"MZ").unwrap();
+        let report = detect_anti_cheat(&root);
+        assert!(report.detected.is_empty());
+        assert!(report.advisory.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn eac_wrapper_is_not_ranked_as_the_game() {
+        assert_eq!(classify("start_protected_game.exe"), ExecutableKind::Launcher);
+        assert_eq!(classify("EACLauncher.exe"), ExecutableKind::Launcher);
+        assert_eq!(classify("BEService_x64.exe"), ExecutableKind::Tool);
     }
 
     #[test]
