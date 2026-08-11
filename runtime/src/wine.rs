@@ -21,7 +21,10 @@ const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(1800);
 const DARWINWINE_MANIFEST_SCHEMA: u32 = 2;
 const MIN_DARWINWINE_CX_MAJOR: u32 = 26;
 const MIN_DARWINWINE_CX_MINOR: u32 = 3;
-const MIN_DARWINWINE_DP_REVISION: u32 = 5;
+/// dp9 is the first runtime whose kernelbase injects --in-process-gpu into
+/// Steam CEF processes; older runtimes need the retired webhelper shim that
+/// this DarwinPlay no longer installs, so they would render Steam black.
+const MIN_DARWINWINE_DP_REVISION: u32 = 9;
 
 #[derive(Clone)]
 pub struct WineRuntime {
@@ -257,7 +260,7 @@ fn validate_supported_darwinwine_version(value: &str) -> Result<()> {
     let value_without_prefix = value
         .strip_prefix("cx")
         .ok_or_else(|| AppError::Runtime(format!(
-            "unsupported DarwinWine version {value}; DarwinPlay requires CrossOver-derived cx26.3-dp5 or newer"
+            "unsupported DarwinWine version {value}; DarwinPlay requires CrossOver-derived cx26.3-dp9 or newer"
         )))?;
     let (crossover, revision) = value_without_prefix
         .split_once("-dp")
@@ -281,7 +284,7 @@ fn validate_supported_darwinwine_version(value: &str) -> Result<()> {
         || (crossover_version == minimum_crossover && revision < MIN_DARWINWINE_DP_REVISION)
     {
         return Err(AppError::Runtime(format!(
-            "DarwinWine {value} is too old; DarwinPlay requires cx26.3-dp5 or newer"
+            "DarwinWine {value} is too old; DarwinPlay requires cx26.3-dp9 or newer"
         )));
     }
     Ok(())
@@ -1236,9 +1239,11 @@ mod tests {
     }
 
     #[test]
-    fn accepts_cx26_3_dp5_and_newer_darwinwine() {
-        assert!(validate_supported_darwinwine_version("cx26.3-dp5").is_ok());
-        assert!(validate_supported_darwinwine_version("cx26.3-dp6").is_ok());
+    fn accepts_cx26_3_dp9_and_newer_darwinwine() {
+        assert!(validate_supported_darwinwine_version("cx26.3-dp5").is_err());
+        assert!(validate_supported_darwinwine_version("cx26.3-dp8").is_err());
+        assert!(validate_supported_darwinwine_version("cx26.3-dp9").is_ok());
+        assert!(validate_supported_darwinwine_version("cx26.3-dp10").is_ok());
         assert!(validate_supported_darwinwine_version("cx26.4-dp1").is_ok());
         assert!(validate_supported_darwinwine_version("cx27.0-dp1").is_ok());
     }
@@ -1246,10 +1251,10 @@ mod tests {
     fn decodes_canonical_minimum_macos_manifest_field() {
         let manifest: DarwinWineManifest = serde_json::from_str(r#"{
             "schemaVersion":2,
-            "id":"darwinwine-cx26.3-dp5",
+            "id":"darwinwine-cx26.3-dp9",
             "name":"DarwinWine",
             "wineVersion":"10.0",
-            "darwinWineVersion":"cx26.3-dp5",
+            "darwinWineVersion":"cx26.3-dp9",
             "architecture":"x86_64",
             "minimumMacOS":"13.0",
             "channel":"experimental",
@@ -1265,10 +1270,10 @@ mod tests {
     fn accepts_legacy_minimum_macos_alias() {
         let manifest: DarwinWineManifest = serde_json::from_str(r#"{
             "schemaVersion":2,
-            "id":"darwinwine-cx26.3-dp5",
+            "id":"darwinwine-cx26.3-dp9",
             "name":"DarwinWine",
             "wineVersion":"10.0",
-            "darwinWineVersion":"cx26.3-dp5",
+            "darwinWineVersion":"cx26.3-dp9",
             "architecture":"x86_64",
             "minimumMacOs":"13.0",
             "channel":"experimental",
@@ -1284,10 +1289,10 @@ mod tests {
     fn accepts_schema2_crossover_manifest() {
         let manifest: DarwinWineManifest = serde_json::from_str(r#"{
             "schemaVersion":2,
-            "id":"darwinwine-cx26.3-dp5",
+            "id":"darwinwine-cx26.3-dp9",
             "name":"DarwinWine",
             "wineVersion":"10.0",
-            "darwinWineVersion":"cx26.3-dp5",
+            "darwinWineVersion":"cx26.3-dp9",
             "architecture":"x86_64",
             "minimumMacOS":"13.0",
             "channel":"experimental",
@@ -1308,10 +1313,10 @@ mod tests {
     fn rejects_schema1_manifest() {
         let manifest: DarwinWineManifest = serde_json::from_str(r#"{
             "schemaVersion":1,
-            "id":"darwinwine-cx26.3-dp5",
+            "id":"darwinwine-cx26.3-dp9",
             "name":"DarwinWine",
             "wineVersion":"10.0",
-            "darwinWineVersion":"cx26.3-dp5",
+            "darwinWineVersion":"cx26.3-dp9",
             "architecture":"x86_64",
             "minimumMacOS":"13.0",
             "channel":"experimental",

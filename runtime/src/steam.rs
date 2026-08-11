@@ -22,14 +22,11 @@ const STEAM_RESTART_LIMIT: usize = 3;
 const STEAM_INSTALL_TIMEOUT_SECS: u64 = 90;
 const STEAM_UI_POLICY_VERSION: u32 = 10;
 
-/// Injects `--in-process-gpu` into every CEF process Steam spawns. Without it
-/// Steam's windows paint into nothing and render black: Wine implements
-/// cross-process rendering only in winex11.drv, and winemac.drv registers no
-/// pGetDC to compensate, so Chromium presenting into an HWND owned by a remote
-/// process is discarded. Steam does not forward the flag from its own command
-/// line, and it re-runs steamwebhelper.exe for each CEF child, so the flag has
-/// to be injected at that binary.
-const STEAM_WEBHELPER_SHIM: &[u8] = include_bytes!("../assets/steamwebhelper-shim.exe");
+/// Marker of the retired DarwinPlay steamwebhelper shim. Since DarwinWine
+/// cx26.3-dp9 the runtime itself appends `--in-process-gpu` to every Steam CEF
+/// process at CreateProcess time (kernelbase launcher policy), so the shim
+/// that used to replace steamwebhelper.exe is no longer installed; launches
+/// now restore the stock helper wherever an old shim is still present.
 const STEAM_WEBHELPER_SHIM_MARKER: &[u8] = b"DARWINPLAY_SWH_SHIM_V1";
 /// The genuine helper is ~7 MiB, so anything this small cannot be it.
 const STEAM_WEBHELPER_SHIM_MAX_LEN: u64 = 1_048_576;
@@ -75,7 +72,8 @@ pub struct SteamUiDiagnostics {
     pub disable_gpu_compositing_observed: bool,
     pub registry_gpu_acceleration_disabled: bool,
     pub vulkan_observed: bool,
-    /// The shim is what keeps Steam's windows from rendering black.
+    /// The flag (injected by the DarwinWine launcher policy) is what keeps
+    /// Steam's windows from rendering black.
     pub in_process_gpu_observed: bool,
 }
 
@@ -655,17 +653,19 @@ fn emit_steam_state(json: bool, kind: &str, message: &str) -> Result<()> {
 fn steam_cef_safe_arguments(arguments: &[String]) -> Vec<String> {
     // -cef-disable-gpu was an attempt to work around the black-window bug. It
     // never fixed it and only costs acceleration, so it is dropped even when a
-    // caller asks for it. -noverifyfiles keeps Steam from repairing the shim
-    // back to the stock helper mid-session.
+    // caller asks for it. -noverifyfiles is dropped too: it only existed to
+    // keep Steam from repairing the retired webhelper shim mid-session.
     let mut result: Vec<String> = arguments
         .iter()
-        .filter(|argument| !argument.eq_ignore_ascii_case("-cef-disable-gpu"))
+        .filter(|argument| {
+            !argument.eq_ignore_ascii_case("-cef-disable-gpu")
+                && !argument.eq_ignore_ascii_case("-noverifyfiles")
+        })
         .cloned()
         .collect();
-    for flag in ["-system-composer", "-noverifyfiles"] {
-        if !result.iter().any(|argument| argument.eq_ignore_ascii_case(flag)) {
-            result.insert(0, flag.to_string());
-        }
+    let composer = "-system-composer";
+    if !result.iter().any(|argument| argument.eq_ignore_ascii_case(composer)) {
+        result.insert(0, composer.to_string());
     }
     result
 }
@@ -681,16 +681,16 @@ fn is_webhelper_shim(path: &Path) -> Result<bool> {
         .any(|window| window == STEAM_WEBHELPER_SHIM_MARKER))
 }
 
-/// Installs the shim into every CEF directory Steam ships, preserving the stock
-/// helper as steamwebhelper_real.exe. Idempotent, and re-runs cheaply after
-/// Steam restores its own binary on update or file verification. Returns the
-/// number of directories that had to be (re)shimmed.
-fn install_webhelper_shim(prefix: &Path) -> Result<usize> {
+/// Undoes the retired shim in every CEF directory Steam ships: puts the
+/// preserved stock helper back in place of the shim, and drops a stale
+/// preserved copy once the live helper is genuine again. Returns the number
+/// of directories that were cleaned up.
+fn restore_webhelper_shim(prefix: &Path) -> Result<usize> {
     let cef_root = prefix.join("drive_c/Program Files (x86)/Steam/bin/cef");
     if !cef_root.is_dir() {
         return Ok(0);
     }
-    let mut installed = 0;
+    let mut restored = 0;
     for entry in fs::read_dir(&cef_root)? {
         let directory = entry?.path();
         let live = directory.join("steamwebhelper.exe");
@@ -699,24 +699,24 @@ fn install_webhelper_shim(prefix: &Path) -> Result<usize> {
         }
         let stock = directory.join("steamwebhelper_real.exe");
         if is_webhelper_shim(&live)? {
-            if stock.is_file() {
-                continue;
+            if !stock.is_file() {
+                return Err(AppError::ProcessFailed(format!(
+                    "{} is the retired DarwinPlay shim but {} is missing; \
+                     run Steam's own file verification to restore the helper",
+                    live.display(),
+                    stock.display()
+                )));
             }
-            return Err(AppError::ProcessFailed(format!(
-                "{} is the DarwinPlay shim but {} is missing; \
-                 run Steam's own file verification to restore the helper",
-                live.display(),
-                stock.display()
-            )));
+            fs::remove_file(&live)?;
+            fs::rename(&stock, &live)?;
+            restored += 1;
+        } else if stock.is_file() {
+            // Steam already repaired its helper; the preserved copy is stale.
+            fs::remove_file(&stock)?;
+            restored += 1;
         }
-        // `live` is Steam's own helper: either a first install, or Steam just
-        // replaced the shim. Refresh the preserved copy so an updated helper is
-        // what actually runs.
-        fs::copy(&live, &stock)?;
-        fs::write(&live, STEAM_WEBHELPER_SHIM)?;
-        installed += 1;
     }
-    Ok(installed)
+    Ok(restored)
 }
 
 fn launch_steam_client(
@@ -728,11 +728,11 @@ fn launch_steam_client(
 ) -> Result<()> {
     let client_arguments = steam_cef_safe_arguments(arguments);
     apply_steam_cef_safe_mode(runtime, prefix)?;
-    if install_webhelper_shim(prefix)? > 0 {
+    if restore_webhelper_shim(prefix)? > 0 {
         emit_steam_state(
             json,
             "webhelper_shim",
-            "Installed CEF in-process-GPU shim (Steam had restored its own helper)",
+            "Removed the retired CEF shim; the runtime injects --in-process-gpu itself",
         )?;
     }
     write_steam_ui_session()?;
@@ -1073,22 +1073,23 @@ mod tests {
 
 
     #[test]
-    fn steam_cef_safe_mode_adds_composer_and_noverify_once() {
-        let arguments = vec!["-silent".to_string()];
+    fn steam_cef_safe_mode_adds_composer_and_drops_noverify() {
+        let arguments = vec!["-noverifyfiles".to_string(), "-silent".to_string()];
         assert_eq!(
             steam_cef_safe_arguments(&arguments),
-            vec![
-                "-noverifyfiles".to_string(),
-                "-system-composer".to_string(),
-                "-silent".to_string(),
-            ]
+            vec!["-system-composer".to_string(), "-silent".to_string()]
         );
+        // Case-insensitive: the uppercase variant is dropped too, and an
+        // already-present composer flag is not duplicated.
         let existing = vec![
             "-NOVERIFYFILES".to_string(),
             "-SYSTEM-COMPOSER".to_string(),
             "-silent".to_string(),
         ];
-        assert_eq!(steam_cef_safe_arguments(&existing), existing);
+        assert_eq!(
+            steam_cef_safe_arguments(&existing),
+            vec!["-SYSTEM-COMPOSER".to_string(), "-silent".to_string()]
+        );
     }
 
     #[test]
@@ -1105,7 +1106,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let shim = root.join("steamwebhelper.exe");
-        fs::write(&shim, STEAM_WEBHELPER_SHIM).unwrap();
+        fs::write(&shim, STEAM_WEBHELPER_SHIM_MARKER).unwrap();
         assert!(is_webhelper_shim(&shim).unwrap());
 
         // Stock helper: large and without the marker.
@@ -1117,30 +1118,32 @@ mod tests {
     }
 
     #[test]
-    fn shim_install_preserves_stock_helper_and_is_idempotent() {
-        let root = std::env::temp_dir().join(format!("dp-shim-inst-{}", std::process::id()));
+    fn shim_restore_puts_the_stock_helper_back() {
+        let root = std::env::temp_dir().join(format!("dp-shim-rest-{}", std::process::id()));
         let cef = root.join("drive_c/Program Files (x86)/Steam/bin/cef/cef.win64");
         fs::create_dir_all(&cef).unwrap();
         let live = cef.join("steamwebhelper.exe");
-        fs::write(&live, b"ORIGINAL-HELPER").unwrap();
+        let stock = cef.join("steamwebhelper_real.exe");
 
-        assert_eq!(install_webhelper_shim(&root).unwrap(), 1);
-        assert!(is_webhelper_shim(&live).unwrap());
-        assert_eq!(
-            fs::read(cef.join("steamwebhelper_real.exe")).unwrap(),
-            b"ORIGINAL-HELPER"
-        );
+        // An old shim with its preserved helper: the helper comes back.
+        fs::write(&live, STEAM_WEBHELPER_SHIM_MARKER).unwrap();
+        fs::write(&stock, b"ORIGINAL-HELPER").unwrap();
+        assert_eq!(restore_webhelper_shim(&root).unwrap(), 1);
+        assert_eq!(fs::read(&live).unwrap(), b"ORIGINAL-HELPER");
+        assert!(!stock.exists());
 
-        // Already shimmed: nothing to do, and the preserved copy is untouched.
-        assert_eq!(install_webhelper_shim(&root).unwrap(), 0);
+        // Genuine helper, nothing preserved: nothing to do.
+        assert_eq!(restore_webhelper_shim(&root).unwrap(), 0);
 
-        // Steam repaired its helper: reshim, and pick up the newer binary.
-        fs::write(&live, b"UPDATED-HELPER").unwrap();
-        assert_eq!(install_webhelper_shim(&root).unwrap(), 1);
-        assert_eq!(
-            fs::read(cef.join("steamwebhelper_real.exe")).unwrap(),
-            b"UPDATED-HELPER"
-        );
+        // Steam already repaired the helper itself: the stale copy is dropped.
+        fs::write(&stock, b"STALE-COPY").unwrap();
+        assert_eq!(restore_webhelper_shim(&root).unwrap(), 1);
+        assert!(!stock.exists());
+        assert_eq!(fs::read(&live).unwrap(), b"ORIGINAL-HELPER");
+
+        // A shim without its preserved helper is unrecoverable here.
+        fs::write(&live, STEAM_WEBHELPER_SHIM_MARKER).unwrap();
+        assert!(restore_webhelper_shim(&root).is_err());
 
         fs::remove_dir_all(&root).unwrap();
     }
