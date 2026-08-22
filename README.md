@@ -185,3 +185,7 @@ DarwinPlay launches the Windows Steam client with GPU-accelerated CEF web views 
 ## Steam UI composition policy
 
 DarwinPlay keeps the Steam client UI on WineD3D/system composition even when DXMT is installed for games. Steam is launched with `-cef-disable-gpu -system-composer`, while `GPUAccelWebViewsV3` remains disabled. DXMT remains a per-game graphics backend.
+
+## Known game fixes
+
+DarwinPlay now carries a declarative per-game compatibility database (`runtime/src/gamefix.rs`). Each entry is data — AppID, executable, DLL overrides, and the reason the fix exists — with test coverage; fixes are re-applied idempotently on every launch as `AppDefaults` DLL overrides in the prefix registry, so recreated prefixes heal themselves and nothing generated is persisted. Applied fixes surface in the compatibility profile (`gameFixes`, plus a `reasons` line) and as `game_fix_applied` launch events. First entry: Dragon's Dogma 2 disables `nvapi64` for `DD2.exe`, which otherwise sends NVIDIA Streamline down the NVAPI path on D3DMetal and crashes at launch.

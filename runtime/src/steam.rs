@@ -2,6 +2,7 @@ use crate::app_dirs::application_support;
 use crate::compatibility::{validate_relative_executable, CompatibilityManager, SteamCompatibilityProfile};
 use crate::error::{AppError, Result};
 use crate::events::{write_json, write_progress, RuntimeEvent};
+use crate::gamefix;
 use crate::pe::inspect_pe;
 use crate::prefix::PrefixManager;
 use crate::vdf::{self, VdfValue};
@@ -370,6 +371,26 @@ impl SteamManager {
         let steam = find_steam_executable(&prefix).ok_or(AppError::SteamNotInstalled)?;
         let profile = self.profile(app_id)?;
         let (_imports, launch_arguments) = self.compatibility.launch_configuration(&profile);
+
+        // Known per-game fixes live in the prefix registry, so they must be
+        // (re)applied before every launch: the write is idempotent and a
+        // recreated prefix heals itself. A failed fix is surfaced but does not
+        // block the launch -- without the fix the game is no worse off, and
+        // hiding the launch behind a fix regression would be strictly worse.
+        match gamefix::apply(runtime, &prefix, app_id) {
+            Ok(applied) => {
+                for message in &applied {
+                    emit_steam_state(json, "game_fix_applied", message)?;
+                }
+            }
+            Err(error) => {
+                emit_steam_state(
+                    json,
+                    "game_fix_failed",
+                    &format!("Could not apply compatibility fix: {error}"),
+                )?;
+            }
+        }
 
         // Some titles cannot be started through Steam at all: Steam resolves the
         // executable from its own app info, and when that record carries no launch

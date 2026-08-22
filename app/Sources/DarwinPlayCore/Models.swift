@@ -137,6 +137,12 @@ public struct AntiCheatReport: Codable, Equatable, Sendable {
   public let advisory: String?
 }
 
+public struct GameFixReport: Codable, Equatable, Sendable {
+  public let executable: String
+  public let dllOverrides: [String]
+  public let reason: String
+}
+
 public struct SteamCompatibilityProfile: Codable, Equatable, Sendable {
   public let appId: UInt32
   public let name: String
@@ -146,6 +152,7 @@ public struct SteamCompatibilityProfile: Codable, Equatable, Sendable {
   public let compatibility: SteamCompatibilityLevel
   public let reasons: [String]
   public let antiCheat: AntiCheatReport?
+  public let gameFixes: [GameFixReport]
   public let candidates: [SteamExecutableCandidate]
 
   public init(from decoder: Decoder) throws {
@@ -158,6 +165,7 @@ public struct SteamCompatibilityProfile: Codable, Equatable, Sendable {
     compatibility = try container.decode(SteamCompatibilityLevel.self, forKey: .compatibility)
     reasons = try container.decodeIfPresent([String].self, forKey: .reasons) ?? []
     antiCheat = try container.decodeIfPresent(AntiCheatReport.self, forKey: .antiCheat)
+    gameFixes = try container.decodeIfPresent([GameFixReport].self, forKey: .gameFixes) ?? []
     candidates = try container.decodeIfPresent([SteamExecutableCandidate].self, forKey: .candidates) ?? []
   }
 }

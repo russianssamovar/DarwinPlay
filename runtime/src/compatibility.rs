@@ -1,5 +1,6 @@
 use crate::app_dirs::application_support;
 use crate::error::{AppError, Result};
+use crate::gamefix::{self, GameFixReport};
 use crate::pe::{PeReport, inspect_pe};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -85,6 +86,7 @@ pub struct SteamCompatibilityProfile {
     pub compatibility: CompatibilityLevel,
     pub reasons: Vec<String>,
     pub anti_cheat: AntiCheatReport,
+    pub game_fixes: Vec<GameFixReport>,
     pub candidates: Vec<ExecutableCandidate>,
 }
 
@@ -164,6 +166,16 @@ impl CompatibilityManager {
             reasons.push(advisory.clone());
         }
 
+        let game_fixes = gamefix::reports_for(app_id);
+        for fix in &game_fixes {
+            reasons.push(format!(
+                "A known compatibility fix is applied at launch ({}: {}): {}",
+                fix.executable,
+                fix.dll_overrides.join(", "),
+                fix.reason
+            ));
+        }
+
         Ok(SteamCompatibilityProfile {
             app_id,
             name: name.to_string(),
@@ -173,6 +185,7 @@ impl CompatibilityManager {
             compatibility,
             reasons,
             anti_cheat,
+            game_fixes,
             candidates,
         })
     }

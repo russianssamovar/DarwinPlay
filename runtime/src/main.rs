@@ -3,6 +3,7 @@ mod cli;
 mod compatibility;
 mod error;
 mod events;
+mod gamefix;
 mod pe;
 mod prefix;
 mod release;

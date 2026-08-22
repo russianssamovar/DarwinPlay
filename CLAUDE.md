@@ -63,7 +63,7 @@ These are load-bearing decisions, not style preferences. Violating them regresse
 
 **Backend precedence:** per-game override → global preference (`inherit`) → current executable analysis (`auto`). `auto` picks DXMT only for D3D10/11 imports *and* only when DXMT is installed. D3D9 / Vulkan / OpenGL take the Wine path. D3D12 is reported unsupported rather than routed through WineD3D. Unknown imports report unknown instead of guessing.
 
-**No app-specific hardcoded game rules** until a declarative compatibility database exists with test coverage. Likely redistributables, launchers, tools and servers are classified and ranked *below* game executables, never filtered out — the analysis must stay inspectable.
+**App-specific game rules live only in the declarative database.** `gamefix.rs` is that database: every entry is data (AppID, executable, DLL overrides, reason) with test coverage, applied idempotently at every launch via `reg.exe` in the prefix (never by editing `user.reg` — that races wineserver), surfaced in the profile (`gameFixes` + `reasons`) and as `game_fix_applied`/`game_fix_failed` events, and never persisted as applied-state. A fix failure is reported but does not block the launch. No game-specific behavior may exist as code outside this database. Likely redistributables, launchers, tools and servers are classified and ranked *below* game executables, never filtered out — the analysis must stay inspectable.
 
 **Scanning is bounded and deterministic.** `MAX_SCAN_DEPTH = 8`, `MAX_EXECUTABLES = 512`, symlinks are not followed. Launch arguments are bounded too (`MAX_LAUNCH_ARGUMENTS = 64`, 1024 chars each, 8192 total).
 
@@ -101,5 +101,5 @@ Top-level destinations are Home, Games, Console (`ContentView.swift`). Initial W
 
 ## Notes
 
-- This working copy is not a git repository, so there is no history to consult and no commits to make.
+- This working copy is a git repository; keep commits small and imperative (see `git log` for the style).
 - Docs to keep in sync with behavior changes: `docs/ARCHITECTURE.md`, `docs/COMPATIBILITY.md`, `docs/DEVELOPMENT.md`, `docs/SECURITY.md`, plus the versioned changelog sections at the end of `README.md`. The version lives in `runtime/Cargo.toml`.
